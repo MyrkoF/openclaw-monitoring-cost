@@ -10,13 +10,13 @@ Tourne sur Docker, accessible uniquement via VPN (usage personnel).
 | Prérequis | Requis | Usage |
 |---|---|---|
 | **Docker + docker-compose** | ✅ Obligatoire | Lancer le container |
+| **Python 3** | ✅ Obligatoire | Lancer `daily-health-check.py` sur le host |
 | **OpenClaw installé** (`openclaw`) | ✅ Obligatoire | Logs de sessions pour coûts Anthropic/Google |
 | **Dossier `~/.openclaw/logs`** | ✅ Obligatoire | Monté en lecture seule — logs d'usage |
 | **Dossier `~/.openclaw/agents`** | ✅ Obligatoire | Monté en lecture seule — sessions tokens |
-| **Docker socket** `/var/run/docker.sock` | ✅ Obligatoire | Containers list + Watchtower logs |
-| **Claude Code CLI** (`~/.claude/`) | Optionnel | Billing Anthropic via token CLI |
-| **Service account GCP** JSON key | Optionnel | Billing Google Cloud réel |
-| **Token Watchtower HTTP API** | Optionnel | Logs Watchtower via API (fallback: docker logs) |
+| **Claude Code CLI** (`~/.claude/`) | Optionnel | Billing Anthropic via token CLI — opt-in |
+| **Service account GCP** JSON key | Optionnel | Billing Google Cloud réel — opt-in |
+| **Token Watchtower HTTP API** | Optionnel | Métriques Watchtower via API (fallback : sidecar) |
 
 ---
 
@@ -40,6 +40,24 @@ Tourne sur Docker, accessible uniquement via VPN (usage personnel).
 
 ---
 
+## Architecture
+
+```
+HOST (cron */10 min)
+  └─ daily-health-check.py
+       └─ écrit → ./data/host-health.json
+
+DOCKER CONTAINER
+  └─ app/health_collector.py
+       └─ lit ← /data/host-health.json  (volume partagé ./data:/data)
+       └─ lit ← /proc/*                 (métriques CPU/RAM/disque natives)
+       └─ appelle API providers         (OpenRouter, OpenAI, Anthropic, Google)
+```
+
+Le container n'a **pas** accès au Docker socket — toutes les données host passent par le fichier sidecar JSON.
+
+---
+
 ## Installation
 
 ### 1. Cloner le dépôt
@@ -51,9 +69,28 @@ cd openclaw-monitoring-cost
 
 ### 2. Configurer les clés API
 
+**Option A — Avec OpenClaw (recommandé sur ce VPS)**
+
+Les clés sont lues automatiquement depuis `~/.openclaw/openclaw.json` :
+
+```bash
+./start.sh    # Injecte les clés OpenClaw + lance docker compose
+```
+
+Variables extraites depuis OpenClaw :
+
+| Variable OpenClaw | Variable injectée |
+|---|---|
+| `OPENAI_API_KEY_MONITORING` | `OPENAI_API_KEY` |
+| `OPENROUTER_API_KEY_MONITORING` | `OPENROUTER_API_KEY` |
+| `ANTHROPIC_API_KEY_MONITORING` | `ANTHROPIC_API_KEY` |
+
+**Option B — Sans OpenClaw (déploiement universel)**
+
 ```bash
 cp .env.example .env
 # Éditer .env avec vos clés API
+docker compose up -d --build
 ```
 
 Voir `.env.example` pour la liste complète et les instructions de création de clés.
@@ -69,7 +106,7 @@ Si tu veux le coût GCP réel (pas seulement l'estimation logs) :
 5. S'assurer que le compte a le rôle `Billing Account Viewer`
 6. Décommenter la ligne de volume dans `docker-compose.yml` :
    ```yaml
-   - /home/myrko/google-sa-key.json:/google-sa-key.json:ro
+   - ~/google-sa-key.json:/google-sa-key.json:ro
    ```
 
 ### 4. (Optionnel) Billing Anthropic Console
@@ -81,31 +118,39 @@ Si tu as des crédits prépayés Anthropic :
   Ajouter dans `.env` : `ANTHROPIC_CONSOLE_API_KEY=sk-ant-...`
 
 - **Option B** — Token Claude Code CLI :
-  Le container monte `~/.claude/` en lecture seule automatiquement.
-  Le dashboard tente de lire le token d'authentification CLI.
+  Décommenter la ligne de volume dans `docker-compose.yml` :
+  ```yaml
+  - ${HOME}/.claude:/claude-home:ro
+  ```
+  Le dashboard lira alors le token d'authentification CLI automatiquement.
 
-### 5. (Optionnel) Cron job daily-health-check.py
+### 5. Configurer le cron job `daily-health-check.py`
 
-Pour alimenter les sections **Docker**, **Watchtower**, **APT**, **OpenClaw Doctor**, **Security Audit** et **Services** du dashboard :
+Ce script tourne sur le **host** (pas dans Docker) et alimente les sections **Docker**, **Watchtower**, **APT**, **OpenClaw Doctor**, **Security Audit** et **Services** du dashboard.
 
 ```bash
 # Tester manuellement (depuis le répertoire du projet)
-cd ~/openclaw-monitoring-cost && python3 daily-health-check.py
+cd ~/openclaw-monitoring-cost
+python3 daily-health-check.py
 
-# Ajouter en cron (exemple : toutes les 10 minutes)
+# Vérifier le résultat
+cat data/host-health.json | python3 -m json.tool
+
+# Ajouter en cron (toutes les 10 minutes)
 crontab -e
+# Ajouter la ligne :
 # */10 * * * * cd ~/openclaw-monitoring-cost && python3 daily-health-check.py >/dev/null 2>&1
 ```
 
-Le script écrit automatiquement un fichier `data/daily-health.json` lu par le dashboard.
+Le script écrit `data/host-health.json` lu par le container via le volume partagé `./data:/data`.
 
 ### 6. Lancer
 
 ```bash
-# Via start.sh (injecte les clés depuis openclaw.json)
+# Via start.sh (Option A — injecte les clés depuis openclaw.json)
 ./start.sh
 
-# Ou directement
+# Ou directement (Option B — nécessite un fichier .env)
 docker compose up -d --build
 ```
 
@@ -119,13 +164,13 @@ Voir `.env.example` pour la liste complète.
 
 | Variable | Requis | Description |
 |---|---|---|
-| `OPENAI_API_KEY_MONITORING` | Oui | Admin key OpenAI |
+| `OPENAI_API_KEY_MONITORING` | Oui | Admin key OpenAI (scope `api.usage.read`) |
 | `OPENROUTER_API_KEY_MONITORING` | Oui | Clé API OpenRouter |
-| `ANTHROPIC_API_KEY_MONITORING` | Oui | Clé API Anthropic (logs) |
-| `GOOGLE_API_KEY` | Optionnel | Clé API Gemini |
+| `ANTHROPIC_API_KEY_MONITORING` | Oui | Clé API Anthropic (lecture logs) |
+| `GOOGLE_API_KEY` | Optionnel | Clé API Gemini direct |
 | `ANTHROPIC_CONSOLE_API_KEY` | Optionnel | Clé Console billing Anthropic |
-| `WATCHTOWER_API_URL` | Optionnel | URL API Watchtower (défaut: host.docker.internal:8080) |
-| `WATCHTOWER_API_TOKEN` | Optionnel | Token API Watchtower (vide = docker logs) |
+| `WATCHTOWER_API_URL` | Optionnel | URL API Watchtower (défaut : `http://host.docker.internal:8080`) |
+| `WATCHTOWER_API_TOKEN` | Optionnel | Token API Watchtower (vide = fallback sidecar) |
 | `GOOGLE_SA_KEY_PATH` | Optionnel | Chemin JSON service account GCP |
 
 ---
@@ -137,8 +182,8 @@ Voir `.env.example` pour la liste complète.
 | `./data` | `/data` | SQLite + health cache + sidecar hôte |
 | `~/.openclaw/logs` | `/openclaw-logs` | Logs OpenClaw (lecture seule) |
 | `~/.openclaw/agents` | `/openclaw-sessions` | Sessions OpenClaw (lecture seule) |
-| `~/.claude` | `/claude-home` | Claude Code CLI config — **opt-in**, décommenter dans docker-compose.yml |
-| `~/google-sa-key.json` | `/google-sa-key.json` | Service account GCP — **opt-in**, décommenter dans docker-compose.yml |
+| `~/.claude` | `/claude-home` | Claude Code CLI config — **opt-in**, décommenter dans `docker-compose.yml` |
+| `~/google-sa-key.json` | `/google-sa-key.json` | Service account GCP — **opt-in**, décommenter dans `docker-compose.yml` |
 
 ---
 
@@ -148,9 +193,9 @@ Voir `.env.example` pour la liste complète.
 ├── app/
 │   ├── app.py              # Dashboard Streamlit
 │   ├── collectors.py       # Collecte API par fournisseur
-│   ├── health_collector.py # Métriques système Linux (via /proc)
+│   ├── health_collector.py # Métriques système Linux (via /proc + sidecar)
 │   └── requirements.txt
-├── daily-health-check.py   # Cron job host — doctor + audit → JSON sidecar
+├── daily-health-check.py   # Cron job host — collecte exhaustive → data/host-health.json
 ├── data/                   # SQLite + health cache (gitignored)
 ├── Dockerfile
 ├── docker-compose.yml
@@ -167,7 +212,12 @@ Voir `.env.example` pour la liste complète.
 - 🏦 Double vue Anthropic : billing API (si configuré) + estimation logs
 - 🏦 OpenAI : crédits prépayés (si compte prépayé) ou mode postpayé
 - 📅 Sélecteur de période : 1j / 7j / 30j
-- 🖥️ System Health : uptime, CPU%, RAM, disque, Docker containers, Watchtower
-- 🔒 OpenClaw Doctor + Security Audit (depuis cron job daily-health-check.py)
+- 🖥️ System Health : uptime, CPU%, RAM, disque (via `/proc` — sans `procps`)
+- 🐳 Docker containers : liste + compteurs running / stopped / total
+- 🔄 Watchtower : mises à jour détectées + erreurs signalées
+- ⚙️ Services systemd : statuts en temps réel (ssh, ufw, fail2ban, nginx…)
+- 🌡️ Global status badge : ✅/⚠️/❌ agrégé depuis toutes les sections du sidecar
+- 🔒 OpenClaw Doctor + Security Audit (depuis `daily-health-check.py`)
+- 📦 APT : packages mis à jour + compteur upgradable
 - 🔄 Cache persistant — données affichées même entre les refreshs
 - 🧵 Thread arrière-plan — métriques système rafraîchies toutes les 5 min
