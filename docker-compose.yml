@@ -18,7 +18,7 @@ services:
       - DB_PATH=${DB_PATH:-/data/monitoring.db}
       - OPENCLAW_LOGS_DIR=${OPENCLAW_LOGS_DIR:-/openclaw-logs}
       - OPENCLAW_SESSIONS_DIR=${OPENCLAW_SESSIONS_DIR:-/openclaw-sessions}
-      # Watchtower HTTP API (optionnel — fallback: docker logs via socket)
+      # Watchtower HTTP API (optionnel — fallback: sidecar host-health.json)
       - WATCHTOWER_API_URL=${WATCHTOWER_API_URL:-http://host.docker.internal:8080}
       - WATCHTOWER_API_TOKEN=${WATCHTOWER_API_TOKEN:-}
       # Anthropic Console billing (optionnel)
@@ -27,18 +27,16 @@ services:
       # Google Cloud service account billing (optionnel)
       - GOOGLE_SA_KEY_PATH=${GOOGLE_SA_KEY_PATH:-/google-sa-key.json}
     volumes:
-      # Données persistantes SQLite + health cache
+      # Données persistantes SQLite + health cache + sidecar hôte
       - ./data:/data
       # Logs OpenClaw en lecture seule
-      - /home/myrko/.openclaw/logs:/openclaw-logs:ro
+      - ${HOME}/.openclaw/logs:/openclaw-logs:ro
       # Sessions OpenClaw (usage tokens) en lecture seule
-      - /home/myrko/.openclaw/agents:/openclaw-sessions:ro
-      # Docker socket — accès lecture au daemon hôte (containers + watchtower logs)
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      # Claude Code CLI config — lecture du token pour billing Anthropic
-      - /home/myrko/.claude:/claude-home:ro
-      # Google service account JSON key (créer le fichier vide si non utilisé)
-      # - /home/myrko/google-sa-key.json:/google-sa-key.json:ro
+      - ${HOME}/.openclaw/agents:/openclaw-sessions:ro
+      # Opt-in : billing Anthropic via token Claude Code CLI (sensible — décommenter si besoin)
+      # - ${HOME}/.claude:/claude-home:ro
+      # Opt-in : billing Google Cloud via service account JSON key
+      # - ${HOME}/google-sa-key.json:/google-sa-key.json:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:

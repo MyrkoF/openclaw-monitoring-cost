@@ -63,7 +63,7 @@ Voir `.env.example` pour la liste complète et les instructions de création de 
 Si tu veux le coût GCP réel (pas seulement l'estimation logs) :
 
 1. Aller sur [GCP Console](https://console.cloud.google.com) > IAM → Service Accounts
-2. Sélectionner `vertex-express@gen-lang-client-...`
+2. Sélectionner ton service account lié à l'API Gemini
 3. Onglet **Clés** → **Ajouter une clé** → JSON → télécharger
 4. Copier le fichier sur le host : `cp key.json ~/google-sa-key.json`
 5. S'assurer que le compte a le rôle `Billing Account Viewer`
@@ -86,15 +86,15 @@ Si tu as des crédits prépayés Anthropic :
 
 ### 5. (Optionnel) Cron job daily-health-check.py
 
-Pour alimenter les sections **OpenClaw Doctor** et **Security Audit** du dashboard :
+Pour alimenter les sections **Docker**, **Watchtower**, **APT**, **OpenClaw Doctor**, **Security Audit** et **Services** du dashboard :
 
 ```bash
-# Tester manuellement
-python3 daily-health-check.py
+# Tester manuellement (depuis le répertoire du projet)
+cd ~/openclaw-monitoring-cost && python3 daily-health-check.py
 
-# Ajouter en cron (exemple : tous les jours à 6h)
+# Ajouter en cron (exemple : toutes les 10 minutes)
 crontab -e
-# 0 6 * * * cd /home/myrko/openclaw-monitoring-cost && python3 daily-health-check.py > /dev/null 2>&1
+# */10 * * * * cd ~/openclaw-monitoring-cost && python3 daily-health-check.py >/dev/null 2>&1
 ```
 
 Le script écrit automatiquement un fichier `data/daily-health.json` lu par le dashboard.
@@ -134,11 +134,11 @@ Voir `.env.example` pour la liste complète.
 
 | Volume local | Volume container | Usage |
 |---|---|---|
-| `./data` | `/data` | SQLite + health cache + daily-health sidecar |
+| `./data` | `/data` | SQLite + health cache + sidecar hôte |
 | `~/.openclaw/logs` | `/openclaw-logs` | Logs OpenClaw (lecture seule) |
 | `~/.openclaw/agents` | `/openclaw-sessions` | Sessions OpenClaw (lecture seule) |
-| `/var/run/docker.sock` | `/var/run/docker.sock` | Docker daemon (lecture seule) |
-| `~/.claude` | `/claude-home` | Claude Code CLI config (lecture seule) |
+| `~/.claude` | `/claude-home` | Claude Code CLI config — **opt-in**, décommenter dans docker-compose.yml |
+| `~/google-sa-key.json` | `/google-sa-key.json` | Service account GCP — **opt-in**, décommenter dans docker-compose.yml |
 
 ---
 

@@ -469,12 +469,15 @@ with tabs[1]:
         except Exception:
             pass
 
-    ts = health.get("collected_at", "")
-    sidecar_ts = health.get("sidecar_at", "")
+    ts          = health.get("collected_at", "")
+    sidecar_ts  = health.get("sidecar_at", "")
+    sidecar_stale = health.get("sidecar_stale", False)
+    gs          = health.get("global_status", "")
+    gs_badge    = {"ok": "✅", "warn": "⚠️", "error": "❌"}.get(gs, "")
     if ts:
+        stale_note = f" · sidecar {'⚠️ expiré' if sidecar_stale else 'OK'} ({sidecar_ts})" if sidecar_ts else ""
         st.caption(
-            f"Métriques système collectées le : {ts} UTC · thread arrière-plan, intervalle 5 min"
-            + (f" · doctor/audit : {sidecar_ts}" if sidecar_ts else "")
+            f"{gs_badge} Métriques système : {ts} UTC · thread 5 min{stale_note}"
         )
     else:
         st.caption("Collecte en cours…")
@@ -498,17 +501,24 @@ with tabs[1]:
             )
 
             # Apt updates card
-            pkgs     = health.get("apt_updates", [])
-            apt_clr  = "yellow" if pkgs else "green"
+            pkgs            = health.get("apt_updates", [])
+            upgradable_cnt  = health.get("apt_upgradable_count", 0)
+            apt_clr         = "yellow" if upgradable_cnt > 10 else ("yellow" if pkgs else "green")
             apt_rows = "".join(
                 f'<div class="sub-num" style="margin-top:2px">{x[-80:]}</div>'
                 for x in pkgs[-5:]
             )
+            upgradable_badge = (
+                f'<span class="badge {"badge" if upgradable_cnt <= 10 else ""}" '
+                f'style="{"color:#fc8181" if upgradable_cnt > 10 else ""}">'
+                f'{upgradable_cnt} upgradable</span>'
+                if upgradable_cnt else ""
+            )
             st.markdown(
                 f'<div class="card">'
-                f'<div class="card-header">📦 Apt updates (24h)</div>'
+                f'<div class="card-header">📦 Apt updates (24h) {upgradable_badge}</div>'
                 f'<div class="big-num {apt_clr}">{len(pkgs)}</div>'
-                f'<div class="sub-num">package(s) mis à jour</div>'
+                f'<div class="sub-num">package(s) mis à jour récemment</div>'
                 f'{apt_rows}'
                 f'</div>',
                 unsafe_allow_html=True,
@@ -516,58 +526,88 @@ with tabs[1]:
 
         with c2:
             # Docker containers card
-            containers = health.get("docker_containers", [])
-            if containers:
+            containers    = health.get("docker_containers", [])
+            docker_counts = health.get("docker_counts", {})
+            d_total   = docker_counts.get("total",   len(containers))
+            d_running = docker_counts.get("running", sum(1 for c in containers if "Up" in c.get("status","")))
+            d_stopped = docker_counts.get("stopped", d_total - d_running)
+            if containers or d_total > 0:
                 container_rows = "".join(
                     f'<div class="model-row">'
-                    f'<span>{"🟢" if "Up" in c.get("status","") else "🔴"} {c["name"]}</span>'
-                    f'<span class="sub-num">{c["status"][:40]}</span>'
+                    f'<span>{"🟢" if c.get("state","") == "running" or "Up" in c.get("status","") else "🔴"} {c.get("name","?")}</span>'
+                    f'<span class="sub-num">{str(c.get("status",""))[:40]}</span>'
                     f'</div>'
                     for c in containers
                 )
+                docker_header = f'🐳 Docker — {d_running}▲ {d_stopped}▼ / {d_total} total'
                 st.markdown(
-                    f'<div class="card"><div class="card-header">🐳 Docker containers</div>{container_rows}</div>',
+                    f'<div class="card"><div class="card-header">{docker_header}</div>{container_rows}</div>',
                     unsafe_allow_html=True,
                 )
             else:
                 st.markdown(
                     '<div class="card">'
                     '<div class="card-header">🐳 Docker</div>'
-                    '<div class="sub-num grey">Docker socket non monté dans le container</div>'
+                    '<div class="sub-num grey">Lancer daily-health-check.py sur le host</div>'
                     '</div>',
                     unsafe_allow_html=True,
                 )
 
             # Watchtower card
             wt         = health.get("watchtower_updates", [])
+            wt_errors  = health.get("watchtower_errors", [])
             wt_source  = health.get("watchtower_source", "logs")
-            wt_color   = "yellow" if wt else "green"
+            wt_color   = "red" if wt_errors else ("yellow" if wt else "green")
             src_badge  = (
                 '<span class="badge badge-green">API</span>'
                 if wt_source == "api"
-                else '<span class="badge">logs</span>'
+                else '<span class="badge">sidecar</span>'
+            )
+            err_badge  = (
+                f'<span class="badge" style="color:#fc8181">⚠️ {len(wt_errors)} erreur(s)</span>'
+                if wt_errors else ""
             )
             wt_rows = "".join(
                 f'<div class="sub-num" style="margin-top:2px">{x[-80:]}</div>'
                 for x in wt[-5:]
             )
+            err_rows = "".join(
+                f'<div class="sub-num" style="color:#fc8181;margin-top:2px">{x[-80:]}</div>'
+                for x in wt_errors[-3:]
+            )
             st.markdown(
                 f'<div class="card">'
-                f'<div class="card-header">🔄 Watchtower (24h) {src_badge}</div>'
+                f'<div class="card-header">🔄 Watchtower {src_badge}{err_badge}</div>'
                 f'<div class="big-num {wt_color}">{len(wt)}</div>'
                 f'<div class="sub-num">image(s) mise(s) à jour</div>'
-                f'{wt_rows}'
+                f'{wt_rows}{err_rows}'
                 f'</div>',
                 unsafe_allow_html=True,
             )
 
+            # Services card
+            services = health.get("services", {})
+            if services:
+                service_rows = "".join(
+                    f'<div class="model-row">'
+                    f'<span>{svc}</span>'
+                    f'<span class="badge {"badge-green" if st_ == "active" else "badge"}" '
+                    f'style="{"" if st_ == "active" else "color:#fc8181"}">{st_}</span>'
+                    f'</div>'
+                    for svc, st_ in services.items()
+                )
+                st.markdown(
+                    f'<div class="card"><div class="card-header">⚙️ Services</div>{service_rows}</div>',
+                    unsafe_allow_html=True,
+                )
+
         # OpenClaw doctor / audit — depuis daily-health-check.py (sidecar JSON)
         doctor = health.get("doctor", "")
         audit  = health.get("security_audit", "")
-        if doctor and "manually" not in doctor:
+        if doctor and "daily-health-check" not in doctor:
             with st.expander("🔒 OpenClaw Doctor"):
                 st.code(doctor, language=None)
-        if audit and "manually" not in audit:
+        if audit and "daily-health-check" not in audit:
             with st.expander("🛡️ Security Audit"):
                 st.code(audit, language=None)
 
