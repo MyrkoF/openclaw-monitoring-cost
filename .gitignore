@@ -1,0 +1,21 @@
+# Secrets — jamais commiter
+.env
+*.bak*
+
+# Données locales
+data/
+*.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+*.log

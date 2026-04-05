@@ -1,0 +1,33 @@
+version: "3.9"
+
+services:
+  monitoring:
+    build: .
+    container_name: ai-monitoring
+    restart: unless-stopped
+    ports:
+      - "8888:8888"
+    # Les clés sont injectées via start.sh depuis le keystore OpenClaw
+    # Ne jamais mettre de clés en dur ici
+    environment:
+      # Clés dédiées monitoring — distinctes des clés prod
+      - OPENAI_API_KEY=${OPENAI_API_KEY_MONITORING}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY_MONITORING}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY_MONITORING}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - DB_PATH=${DB_PATH:-/data/monitoring.db}
+      - OPENCLAW_LOGS_DIR=${OPENCLAW_LOGS_DIR:-/openclaw-logs}
+      - OPENCLAW_SESSIONS_DIR=${OPENCLAW_SESSIONS_DIR:-/openclaw-sessions}
+    volumes:
+      # Données persistantes SQLite + health cache
+      - ./data:/data
+      # Logs OpenClaw en lecture seule
+      - /home/myrko/.openclaw/logs:/openclaw-logs:ro
+      # Sessions OpenClaw (usage tokens) en lecture seule
+      - /home/myrko/.openclaw/agents:/openclaw-sessions:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8888/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
