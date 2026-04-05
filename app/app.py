@@ -4,7 +4,7 @@ app.py — AI Cost Monitor. Cards compactes, période sélectionnable, health au
 """
 
 import os, json, time, threading
-from datetime import datetime
+from datetime import datetime, timedelta
 import streamlit as st
 import pandas as pd
 from collectors import collect_all
@@ -44,6 +44,7 @@ h1 { font-size: 1.3rem !important; margin-bottom: 0.1rem !important; }
 .badge  { display:inline-block; background:#2d3748; border-radius:4px; padding:1px 5px;
           font-size:0.68rem !important; color:#a0aec0; margin-right:3px; }
 .badge-green { background:#1a3a2a; color:#48bb78 !important; }
+.badge-blue  { background:#1a2a3a; color:#63b3ed !important; }
 .model-row { display:flex; justify-content:space-between; align-items:center;
              padding:4px 0; border-bottom:1px solid #1e2535; font-size:0.72rem !important; }
 .model-row:last-child { border-bottom:none; }
@@ -72,7 +73,6 @@ if "health_thread_started" not in st.session_state:
     t = threading.Thread(target=_health_worker, daemon=True)
     t.start()
     st.session_state["health_thread_started"] = True
-    # Premier run immédiat si pas de cache
     if not os.path.exists(HEALTH_CACHE):
         try:
             collect_system()
@@ -89,7 +89,11 @@ with st.sidebar:
     if st.button("🔄 Refresh", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
-    auto = st.checkbox("Auto 5min", value=False)
+    auto = st.checkbox(
+        "Auto 5min (coûts IA)", value=False,
+        help="Recharge la page toutes les 5 min pour actualiser les coûts IA. "
+             "Les métriques système se rafraîchissent via un thread indépendant."
+    )
     st.caption(f"UTC {datetime.utcnow().strftime('%H:%M')}")
 
 
@@ -131,37 +135,46 @@ with tabs[0]:
         s = pd_.get("status", "unknown")
         with col:
             if s == "ok":
-                rem  = pd_.get("remaining_usd")
+                rem  = pd_.get("remaining_usd") or pd_.get("credits_remaining_usd")
                 used = (pd_.get("total_usage_usd_30d")
                         or pd_.get("total_usage_usd")
                         or pd_.get("estimated_cost_usd", 0) or 0)
                 if rem is not None:
-                    clr = "green" if rem > 5 else ("yellow" if rem > 1 else "red")
-                    sub = f"${used:.4f} utilisé"
-                    big = f"${rem:.2f}"
+                    clr    = "green" if rem > 5 else ("yellow" if rem > 1 else "red")
                     label2 = "restant"
+                    big    = f"${rem:.2f}"
                 else:
-                    clr = "yellow"
-                    big = f"${used:.4f}"
+                    clr    = "yellow"
+                    big    = f"${used:.4f}"
                     label2 = f"utilisé ({period})"
-                st.markdown(f"""<div class="card">
-                    <div class="card-header">{icon} {label}</div>
-                    <div class="big-num {clr}">{big}</div>
-                    <div class="sub-num">{label2}</div>
-                </div>""", unsafe_allow_html=True)
+                st.markdown(
+                    f'<div class="card">'
+                    f'<div class="card-header">{icon} {label}</div>'
+                    f'<div class="big-num {clr}">{big}</div>'
+                    f'<div class="sub-num">{label2}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
             elif s in ("no_logs", "no_key"):
-                st.markdown(f"""<div class="card">
-                    <div class="card-header">{icon} {label}</div>
-                    <div class="big-num grey">—</div>
-                    <div class="sub-num grey">{"clé manquante" if s=="no_key" else "aucun log"}</div>
-                </div>""", unsafe_allow_html=True)
+                msg = "clé manquante" if s == "no_key" else "aucun log"
+                st.markdown(
+                    f'<div class="card">'
+                    f'<div class="card-header">{icon} {label}</div>'
+                    f'<div class="big-num grey">—</div>'
+                    f'<div class="sub-num grey">{msg}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
             else:
-                err = (pd_.get("error","erreur"))[:40]
-                st.markdown(f"""<div class="card">
-                    <div class="card-header">{icon} {label}</div>
-                    <div class="big-num red">❌</div>
-                    <div class="sub-num red">{err}</div>
-                </div>""", unsafe_allow_html=True)
+                err = (pd_.get("error", "erreur"))[:40]
+                st.markdown(
+                    f'<div class="card">'
+                    f'<div class="card-header">{icon} {label}</div>'
+                    f'<div class="big-num red">❌</div>'
+                    f'<div class="sub-num red">{err}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
 
     summary_card(c1, "🔀", "OpenRouter", p.get("openrouter", {}))
     summary_card(c2, "🤖", "OpenAI",    p.get("openai", {}))
@@ -173,7 +186,7 @@ with tabs[0]:
     # ── Detail row 1 : OpenRouter + OpenAI ────────────────────────
     col_or, col_oai = st.columns(2)
 
-    # OpenRouter
+    # ── OpenRouter ─────────────────────────────────────────────────
     with col_or:
         d = p.get("openrouter", {})
         if d.get("status") == "ok":
@@ -182,174 +195,265 @@ with tabs[0]:
             rem   = d.get("remaining_usd", 0) or 0
             pct   = min(used / total * 100, 100) if total else 0
             clr   = "green" if rem > 5 else ("yellow" if rem > 1 else "red")
-            bar_w = f"{pct:.1f}%"
+            by_m  = d.get("by_model") or {}
 
-            st.markdown(f"""<div class="card">
-                <div class="card-header">🔀 OpenRouter</div>
-                <div class="nums-row">
-                    <div class="info-block">
-                        <div class="big-num {clr}">${rem:.4f}</div>
-                        <div class="sub-num">restant</div>
-                    </div>
-                    <div class="info-block">
-                        <div class="big-num">${used:.4f}</div>
-                        <div class="sub-num">utilisé (total)</div>
-                    </div>
-                    <div class="info-block">
-                        <div class="big-num grey">${total:.2f}</div>
-                        <div class="sub-num">crédits total</div>
-                    </div>
-                </div>
-                <div class="prog-bar-bg">
-                    <div class="prog-bar-fill" style="width:{bar_w}"></div>
-                </div>
-                <div class="sub-num grey">{pct:.2f}% consommé</div>
-            </div>""", unsafe_allow_html=True)
+            # Lignes par modèle (depuis logs OpenClaw)
+            model_rows = ""
+            for m, v in sorted(by_m.items(), key=lambda x: x[1].get("cost_usd", 0), reverse=True):
+                model_rows += (
+                    f'<div class="model-row">'
+                    f'<span style="max-width:50%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block">{m}</span>'
+                    f'<span>'
+                    f'<span class="badge">in {v["input_tokens"]:,}</span>'
+                    f'<span class="badge">out {v["output_tokens"]:,}</span>'
+                    f'<span class="badge badge-green">${v["cost_usd"]:.4f}</span>'
+                    f'</span></div>'
+                )
+            model_section = (
+                f'<hr class="divider"><div class="sub-num grey" style="margin-bottom:5px">PAR MODÈLE (via logs)</div>{model_rows}'
+                if model_rows else ""
+            )
+
+            st.markdown(
+                f'<div class="card">'
+                f'<div class="card-header">🔀 OpenRouter</div>'
+                f'<div class="nums-row">'
+                f'<div class="info-block"><div class="big-num {clr}">${rem:.4f}</div><div class="sub-num">restant</div></div>'
+                f'<div class="info-block"><div class="big-num">${used:.4f}</div><div class="sub-num">utilisé (total)</div></div>'
+                f'<div class="info-block"><div class="big-num grey">${total:.2f}</div><div class="sub-num">crédits total</div></div>'
+                f'</div>'
+                f'<div class="prog-bar-bg"><div class="prog-bar-fill" style="width:{pct:.1f}%"></div></div>'
+                f'<div class="sub-num grey">{pct:.2f}% consommé</div>'
+                f'{model_section}'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
         else:
-            st.markdown(f"""<div class="card">
-                <div class="card-header">🔀 OpenRouter</div>
-                <div class="sub-num grey">{d.get("status","?")} — {d.get("error","")}</div>
-            </div>""", unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="card">'
+                f'<div class="card-header">🔀 OpenRouter</div>'
+                f'<div class="sub-num grey">{d.get("status","?")} — {d.get("error","")}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
-    # OpenAI
+    # ── OpenAI ─────────────────────────────────────────────────────
     with col_oai:
         d = p.get("openai", {})
         if d.get("status") == "ok":
-            usage = d.get("total_usage_usd_30d", 0) or 0
-            org   = d.get("org", "")
-            daily = d.get("daily", [])
-            by_m  = d.get("by_model") or {}
+            usage  = d.get("total_usage_usd_30d", 0) or 0
+            org    = d.get("org", "")
+            daily  = d.get("daily", [])
+            by_m   = d.get("by_model") or {}
+            pre_rem  = d.get("prepaid_remaining_usd")
+            pre_tot  = d.get("prepaid_total_usd")
+            pre_used = d.get("prepaid_used_usd")
 
-            # Filtrer daily selon période
             if period_days < 30 and daily:
-                from datetime import timedelta
                 cutoff = (datetime.utcnow() - timedelta(days=period_days)).strftime("%Y-%m-%d")
                 daily = [x for x in daily if x["date"] >= cutoff]
             usage_period = sum(x["cost_usd"] for x in daily) if daily else usage
 
-            rows_html = ""
-            for m, v in sorted(by_m.items(), key=lambda x: x[1].get("input_tokens",0), reverse=True):
-                inp  = v.get("input_tokens", 0)
-                out  = v.get("output_tokens", 0)
-                reqs = v.get("requests", 0)
-                rows_html += (
+            badge_org = (
+                f'<span class="badge" style="margin-left:auto;color:#667eea">{org}</span>'
+                if org else ""
+            )
+
+            # Section crédits prépayés (si disponible, format identique OpenRouter)
+            if pre_rem is not None and pre_tot:
+                pre_pct = min((pre_used or 0) / pre_tot * 100, 100) if pre_tot else 0
+                pre_clr = "green" if pre_rem > 5 else ("yellow" if pre_rem > 1 else "red")
+                credits_section = (
+                    f'<div class="nums-row">'
+                    f'<div class="info-block"><div class="big-num {pre_clr}">${pre_rem:.4f}</div><div class="sub-num">crédits restants</div></div>'
+                    f'<div class="info-block"><div class="big-num">${pre_used:.4f}</div><div class="sub-num">utilisé (prépayé)</div></div>'
+                    f'<div class="info-block"><div class="big-num grey">${pre_tot:.2f}</div><div class="sub-num">total prépayé</div></div>'
+                    f'</div>'
+                    f'<div class="prog-bar-bg"><div class="prog-bar-fill" style="width:{pre_pct:.1f}%"></div></div>'
+                    f'<div class="sub-num grey">{pre_pct:.2f}% consommé · ${usage_period:.4f} utilisé ({period})</div>'
+                )
+            else:
+                credits_section = (
+                    f'<div class="nums-row">'
+                    f'<div class="info-block"><div class="big-num yellow">${usage_period:.4f}</div><div class="sub-num">utilisé ({period})</div></div>'
+                    f'<div class="info-block"><div class="big-num grey">postpayé</div><div class="sub-num">pas de solde prépayé</div></div>'
+                    f'</div>'
+                )
+
+            # Lignes par modèle avec coût USD estimé
+            model_rows = ""
+            for m, v in sorted(by_m.items(), key=lambda x: x[1].get("cost_usd", 0), reverse=True):
+                inp   = v.get("input_tokens", 0)
+                out   = v.get("output_tokens", 0)
+                reqs  = v.get("requests", 0)
+                cost  = v.get("cost_usd", 0)
+                model_rows += (
                     f'<div class="model-row">'
-                    f'<span style="max-width:45%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block">{m}</span>'
+                    f'<span style="max-width:40%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block">{m}</span>'
                     f'<span>'
                     f'<span class="badge">in {inp:,}</span>'
                     f'<span class="badge">out {out:,}</span>'
                     f'<span class="badge">{reqs}r</span>'
+                    f'<span class="badge badge-green">${cost:.4f}</span>'
                     f'</span></div>'
                 )
-            badge_org = f'<span class="badge" style="margin-left:auto;color:#667eea">{org}</span>' if org else ""
+            model_section = (
+                f'<hr class="divider"><div class="sub-num grey" style="margin-bottom:5px">PAR MODÈLE (30j) — coût estimé</div>{model_rows}'
+                if model_rows else '<div class="sub-num grey">Aucune donnée</div>'
+            )
 
-            st.markdown(f"""<div class="card">
-                <div class="card-header">🤖 OpenAI {badge_org}</div>
-                <div class="nums-row">
-                    <div class="info-block">
-                        <div class="big-num yellow">${usage_period:.4f}</div>
-                        <div class="sub-num">utilisé ({period})</div>
-                    </div>
-                    <div class="info-block">
-                        <div class="big-num grey">postpayé</div>
-                        <div class="sub-num">pas de solde prépayé</div>
-                    </div>
-                </div>
-                <hr class="divider">
-                <div class="sub-num grey" style="margin-bottom:5px">PAR MODÈLE (30j)</div>
-                {rows_html if rows_html else '<div class="sub-num grey">Aucune donnée</div>'}
-            </div>""", unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="card">'
+                f'<div class="card-header">🤖 OpenAI {badge_org}</div>'
+                f'{credits_section}'
+                f'{model_section}'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
-            # Mini graphe journalier
             if daily:
-                df = pd.DataFrame(daily)
-                df = df[df["cost_usd"] > 0]
-                if not df.empty:
-                    st.line_chart(df.set_index("date")["cost_usd"], height=70, use_container_width=True)
+                df_chart = pd.DataFrame(daily)
+                df_chart = df_chart[df_chart["cost_usd"] > 0]
+                if not df_chart.empty:
+                    st.line_chart(df_chart.set_index("date")["cost_usd"], height=70, use_container_width=True)
         else:
-            st.markdown(f"""<div class="card">
-                <div class="card-header">🤖 OpenAI</div>
-                <div class="sub-num red">{d.get("error","erreur")}</div>
-            </div>""", unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="card">'
+                f'<div class="card-header">🤖 OpenAI</div>'
+                f'<div class="sub-num red">{d.get("error","erreur")}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
     st.markdown("<br>", unsafe_allow_html=True)
 
     # ── Detail row 2 : Anthropic + Google ─────────────────────────
     col_ant, col_goo = st.columns(2)
 
-    # Anthropic
+    # ── Anthropic ──────────────────────────────────────────────────
     with col_ant:
-        d = p.get("anthropic", {})
-        cost    = d.get("estimated_cost_usd", 0) or 0
-        inp_tot = d.get("total_input_tokens", 0) or 0
-        out_tot = d.get("total_output_tokens", 0) or 0
-        by_m    = d.get("by_model") or {}
+        d        = p.get("anthropic", {})
+        cost     = d.get("estimated_cost_usd", 0) or 0
+        inp_tot  = d.get("total_input_tokens", 0) or 0
+        out_tot  = d.get("total_output_tokens", 0) or 0
+        by_m     = d.get("by_model") or {}
+        b_status = d.get("billing_status", "unavailable")
+        b_rem    = d.get("credits_remaining_usd")
+        b_tot    = d.get("credits_total_usd")
+        b_used   = d.get("credits_used_usd")
+        b_src    = d.get("billing_source", "none")
 
-        rows_html = ""
-        for m, v in sorted(by_m.items(), key=lambda x: x[1].get("cost_usd",0), reverse=True):
-            rows_html += (
-                f'<div class="model-row">'
-                f'<span>{m}</span>'
-                f'<span>'
-                f'<span class="badge">in {v["input_tokens"]:,}</span>'
-                f'<span class="badge">out {v["output_tokens"]:,}</span>'
-                f'<span class="badge badge-green">${v["cost_usd"]:.4f}</span>'
-                f'</span></div>'
-            )
-
-        st.markdown(f"""<div class="card">
-            <div class="card-header">🧠 Anthropic</div>
-            <div class="nums-row">
-                <div class="info-block">
-                    <div class="big-num yellow">${cost:.4f}</div>
-                    <div class="sub-num">estimé ({period})</div>
-                </div>
-                <div class="info-block">
-                    <div class="big-num grey">{inp_tot:,}</div>
-                    <div class="sub-num">tokens in</div>
-                </div>
-                <div class="info-block">
-                    <div class="big-num grey">{out_tot:,}</div>
-                    <div class="sub-num">tokens out</div>
-                </div>
-            </div>
-            {'<hr class="divider">'+rows_html if rows_html else ""}
-            <div class="sub-num grey" style="margin-top:6px">
-                ⚠️ Pas d'API billing publique — estimation depuis logs OpenClaw
-            </div>
-        </div>""", unsafe_allow_html=True)
-
-    # Google
-    with col_goo:
-        d     = p.get("google", {})
-        cost  = d.get("estimated_cost_usd", 0) or 0
-        by_m  = d.get("by_model") or {}
-        s     = d.get("status", "?")
-
-        rows_html = ""
-        for m, v in by_m.items():
-            rows_html += (
-                f'<div class="model-row">'
-                f'<span>{m}</span>'
-                f'<span>${v.get("cost_usd",0):.6f}</span>'
+        # Section billing API (si disponible)
+        if b_status == "ok" and b_rem is not None and b_tot:
+            b_pct = min((b_used or 0) / b_tot * 100, 100) if b_tot else 0
+            b_clr = "green" if b_rem > 5 else ("yellow" if b_rem > 1 else "red")
+            src_label = "Console API" if b_src == "console_key" else "Claude CLI"
+            billing_section = (
+                f'<div class="nums-row">'
+                f'<div class="info-block"><div class="big-num {b_clr}">${b_rem:.2f}</div><div class="sub-num">crédits restants</div></div>'
+                f'<div class="info-block"><div class="big-num">${b_used:.2f}</div><div class="sub-num">utilisé (prépayé)</div></div>'
+                f'<div class="info-block"><div class="big-num grey">${b_tot:.2f}</div><div class="sub-num">total prépayé</div></div>'
                 f'</div>'
+                f'<div class="prog-bar-bg"><div class="prog-bar-fill" style="width:{b_pct:.1f}%"></div></div>'
+                f'<div class="sub-num grey">{b_pct:.2f}% consommé · source: {src_label}</div>'
+                f'<hr class="divider">'
             )
+        else:
+            billing_section = ""
 
-        note = ("Modèles Google passent via OpenRouter — comptabilisés dans OpenRouter"
-                if s in ("no_logs", "ok") and not by_m
-                else "Clé API simple — pas d'endpoint usage Google")
+        # Lignes par modèle depuis logs
+        model_rows = "".join(
+            f'<div class="model-row">'
+            f'<span>{m}</span>'
+            f'<span>'
+            f'<span class="badge">in {v["input_tokens"]:,}</span>'
+            f'<span class="badge">out {v["output_tokens"]:,}</span>'
+            f'<span class="badge badge-green">${v["cost_usd"]:.4f}</span>'
+            f'</span></div>'
+            for m, v in sorted(by_m.items(), key=lambda x: x[1].get("cost_usd", 0), reverse=True)
+        )
+        usage_section = (
+            f'<div class="nums-row">'
+            f'<div class="info-block"><div class="big-num yellow">${cost:.4f}</div><div class="sub-num">estimé ({period})</div></div>'
+            f'<div class="info-block"><div class="big-num grey">{inp_tot:,}</div><div class="sub-num">tokens in</div></div>'
+            f'<div class="info-block"><div class="big-num grey">{out_tot:,}</div><div class="sub-num">tokens out</div></div>'
+            f'</div>'
+        )
+        model_divider = '<hr class="divider">' if model_rows else ""
+        note = "" if b_status == "ok" else '<div class="sub-num grey" style="margin-top:6px">⚠️ Billing API non configuré — estimation depuis logs OpenClaw</div>'
 
-        st.markdown(f"""<div class="card">
-            <div class="card-header">🌐 Google Gemini</div>
-            <div class="nums-row">
-                <div class="info-block">
-                    <div class="big-num {'yellow' if cost>0 else 'grey'}">${cost:.4f}</div>
-                    <div class="sub-num">estimé ({period})</div>
-                </div>
-            </div>
-            {'<hr class="divider">'+rows_html if rows_html else ""}
-            <div class="sub-num grey" style="margin-top:6px">ℹ️ {note}</div>
-        </div>""", unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="card">'
+            f'<div class="card-header">🧠 Anthropic</div>'
+            f'{billing_section}'
+            f'{usage_section}'
+            f'{model_divider}{model_rows}'
+            f'{note}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── Google Gemini ───────────────────────────────────────────────
+    with col_goo:
+        d      = p.get("google", {})
+        cost   = d.get("estimated_cost_usd", 0) or 0
+        by_m   = d.get("by_model") or {}
+        s      = d.get("status", "?")
+        b_stat = d.get("billing_status", "no_sa_key")
+        b_tot  = d.get("billing_total_usd")
+        b_svc  = d.get("billing_by_service") or {}
+
+        # Section billing GCP (si disponible)
+        if b_stat == "ok" and b_tot is not None:
+            gcp_rows = "".join(
+                f'<div class="model-row"><span>{svc}</span><span class="badge badge-green">${c:.4f}</span></div>'
+                for svc, c in b_svc.items()
+            )
+            billing_section = (
+                f'<div class="nums-row">'
+                f'<div class="info-block"><div class="big-num yellow">${b_tot:.4f}</div><div class="sub-num">coût GCP réel (mois)</div></div>'
+                f'</div>'
+                f'{"<hr class=\"divider\">" + gcp_rows if gcp_rows else ""}'
+                f'<hr class="divider">'
+            )
+        else:
+            billing_section = ""
+
+        model_rows = "".join(
+            f'<div class="model-row">'
+            f'<span>{m}</span>'
+            f'<span>'
+            f'<span class="badge">in {v["input_tokens"]:,}</span>'
+            f'<span class="badge">out {v["output_tokens"]:,}</span>'
+            f'<span class="badge badge-green">${v.get("cost_usd",0):.4f}</span>'
+            f'</span></div>'
+            for m, v in sorted(by_m.items(), key=lambda x: x[1].get("cost_usd", 0), reverse=True)
+        )
+        cost_color = "yellow" if cost > 0 else "grey"
+        if not model_rows and not by_m:
+            note = "Modèles Google passent via OpenRouter — comptabilisés dans OpenRouter"
+        else:
+            note = "Estimation depuis logs OpenClaw · clé API simple"
+        if b_stat not in ("ok", "no_sa_key"):
+            note += f" · GCP billing: {b_stat}"
+
+        usage_section = (
+            f'<div class="nums-row">'
+            f'<div class="info-block"><div class="big-num {cost_color}">${cost:.4f}</div><div class="sub-num">estimé ({period})</div></div>'
+            f'</div>'
+        )
+        model_divider = '<hr class="divider">' if model_rows else ""
+
+        st.markdown(
+            f'<div class="card">'
+            f'<div class="card-header">🌐 Google Gemini</div>'
+            f'{billing_section}'
+            f'{usage_section}'
+            f'{model_divider}{model_rows}'
+            f'<div class="sub-num grey" style="margin-top:6px">ℹ️ {note}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -357,7 +461,6 @@ with tabs[0]:
 # ══════════════════════════════════════════════════════════════════
 with tabs[1]:
 
-    # Charger le cache (toujours disponible si thread tournant)
     health = {}
     if os.path.exists(HEALTH_CACHE):
         try:
@@ -367,65 +470,98 @@ with tabs[1]:
             pass
 
     ts = health.get("collected_at", "")
+    sidecar_ts = health.get("sidecar_at", "")
     if ts:
-        st.caption(f"Dernier refresh : {ts} UTC · auto-refresh toutes les 5 min")
+        st.caption(
+            f"Métriques système collectées le : {ts} UTC · thread arrière-plan, intervalle 5 min"
+            + (f" · doctor/audit : {sidecar_ts}" if sidecar_ts else "")
+        )
     else:
         st.caption("Collecte en cours…")
 
     if health:
         c1, c2 = st.columns(2)
         with c1:
-            # Uptime + Load
-            st.markdown(f"""<div class="card">
-                <div class="card-header">🖥️ Système</div>
-                <div class="model-row"><span>Uptime</span><span><b>{health.get("uptime","N/A")}</b></span></div>
-                <div class="model-row"><span>Depuis</span><span>{health.get("uptime_since","")}</span></div>
-                <div class="model-row"><span>Load avg</span><span>{health.get("load","")}</span></div>
-                <div class="model-row"><span>CPU cores</span><span>{health.get("cpu_cores","")}</span></div>
-                <div class="model-row"><span>Mémoire</span><span>{health.get("memory","")}</span></div>
-                <div class="model-row"><span>Disque</span><span>{health.get("disk","")}</span></div>
-            </div>""", unsafe_allow_html=True)
+            # Système card
+            sys_rows = (
+                f'<div class="model-row"><span>Uptime</span><span><b>{health.get("uptime","N/A")}</b></span></div>'
+                f'<div class="model-row"><span>Depuis</span><span>{health.get("uptime_since","")}</span></div>'
+                f'<div class="model-row"><span>Load avg</span><span>{health.get("load","")}</span></div>'
+                f'<div class="model-row"><span>CPU cores</span><span>{health.get("cpu_cores","")}</span></div>'
+                f'<div class="model-row"><span>CPU %</span><span>{health.get("cpu_percent","")}</span></div>'
+                f'<div class="model-row"><span>Mémoire</span><span>{health.get("memory","")}</span></div>'
+                f'<div class="model-row"><span>Disque</span><span>{health.get("disk","")}</span></div>'
+            )
+            st.markdown(
+                f'<div class="card"><div class="card-header">🖥️ Système</div>{sys_rows}</div>',
+                unsafe_allow_html=True,
+            )
 
-            # Apt updates
-            pkgs = health.get("apt_updates", [])
-            clr = "yellow" if pkgs else "green"
-            st.markdown(f"""<div class="card">
-                <div class="card-header">📦 Apt updates (24h)</div>
-                <div class="big-num {clr}">{len(pkgs)}</div>
-                <div class="sub-num">package(s) mis à jour</div>
-                {''.join(f'<div class="sub-num" style="margin-top:2px">{x[-80:]}</div>' for x in pkgs[-5:]) if pkgs else ""}
-            </div>""", unsafe_allow_html=True)
+            # Apt updates card
+            pkgs     = health.get("apt_updates", [])
+            apt_clr  = "yellow" if pkgs else "green"
+            apt_rows = "".join(
+                f'<div class="sub-num" style="margin-top:2px">{x[-80:]}</div>'
+                for x in pkgs[-5:]
+            )
+            st.markdown(
+                f'<div class="card">'
+                f'<div class="card-header">📦 Apt updates (24h)</div>'
+                f'<div class="big-num {apt_clr}">{len(pkgs)}</div>'
+                f'<div class="sub-num">package(s) mis à jour</div>'
+                f'{apt_rows}'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
         with c2:
-            # Docker containers
+            # Docker containers card
             containers = health.get("docker_containers", [])
             if containers:
-                st.markdown('<div class="card"><div class="card-header">🐳 Docker containers</div>', unsafe_allow_html=True)
-                for c in containers:
-                    running = "Up" in c.get("status", "")
-                    dot = "🟢" if running else "🔴"
-                    st.markdown(
-                        f'<div class="model-row"><span>{dot} {c["name"]}</span>'
-                        f'<span class="sub-num">{c["status"][:40]}</span></div>',
-                        unsafe_allow_html=True
-                    )
-                st.markdown('</div>', unsafe_allow_html=True)
+                container_rows = "".join(
+                    f'<div class="model-row">'
+                    f'<span>{"🟢" if "Up" in c.get("status","") else "🔴"} {c["name"]}</span>'
+                    f'<span class="sub-num">{c["status"][:40]}</span>'
+                    f'</div>'
+                    for c in containers
+                )
+                st.markdown(
+                    f'<div class="card"><div class="card-header">🐳 Docker containers</div>{container_rows}</div>',
+                    unsafe_allow_html=True,
+                )
             else:
-                st.markdown("""<div class="card">
-                    <div class="card-header">🐳 Docker</div>
-                    <div class="sub-num grey">Docker socket non monté dans le container</div>
-                </div>""", unsafe_allow_html=True)
+                st.markdown(
+                    '<div class="card">'
+                    '<div class="card-header">🐳 Docker</div>'
+                    '<div class="sub-num grey">Docker socket non monté dans le container</div>'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
 
-            # Watchtower
-            wt = health.get("watchtower_updates", [])
-            st.markdown(f"""<div class="card">
-                <div class="card-header">🔄 Watchtower (24h)</div>
-                <div class="big-num {'yellow' if wt else 'green'}">{len(wt)}</div>
-                <div class="sub-num">image(s) mise(s) à jour</div>
-                {''.join(f'<div class="sub-num" style="margin-top:2px">{x[-80:]}</div>' for x in wt[-5:]) if wt else ""}
-            </div>""", unsafe_allow_html=True)
+            # Watchtower card
+            wt         = health.get("watchtower_updates", [])
+            wt_source  = health.get("watchtower_source", "logs")
+            wt_color   = "yellow" if wt else "green"
+            src_badge  = (
+                '<span class="badge badge-green">API</span>'
+                if wt_source == "api"
+                else '<span class="badge">logs</span>'
+            )
+            wt_rows = "".join(
+                f'<div class="sub-num" style="margin-top:2px">{x[-80:]}</div>'
+                for x in wt[-5:]
+            )
+            st.markdown(
+                f'<div class="card">'
+                f'<div class="card-header">🔄 Watchtower (24h) {src_badge}</div>'
+                f'<div class="big-num {wt_color}">{len(wt)}</div>'
+                f'<div class="sub-num">image(s) mise(s) à jour</div>'
+                f'{wt_rows}'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
-        # OpenClaw doctor / audit — depuis daily-health-check.py si dispo
+        # OpenClaw doctor / audit — depuis daily-health-check.py (sidecar JSON)
         doctor = health.get("doctor", "")
         audit  = health.get("security_audit", "")
         if doctor and "manually" not in doctor:
