@@ -5,7 +5,7 @@
 
 set -e
 
-OPENCLAW_JSON="/home/myrko/.openclaw/openclaw.json"
+OPENCLAW_JSON="${HOME}/.openclaw/openclaw.json"
 
 if [ ! -f "$OPENCLAW_JSON" ]; then
   echo "❌ openclaw.json introuvable"
