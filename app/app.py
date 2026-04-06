@@ -12,6 +12,12 @@ from health_collector import collect_system, HEALTH_CACHE
 
 st.set_page_config(page_title="AI Monitor", page_icon="📊", layout="wide")
 
+def _fmt_tokens(n):
+    """Format token count: 1234 -> '1.2K', 123456 -> '123K', 1234567 -> '1.2M'."""
+    if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
+    if n >= 1_000: return f"{n/1_000:.1f}K"
+    return str(n)
+
 # ── CSS ────────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
@@ -213,8 +219,8 @@ with tabs[0]:
                     f'<div class="model-row">'
                     f'<span style="max-width:50%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block">{m}</span>'
                     f'<span>'
-                    f'<span class="badge">in {v["input_tokens"]:,}</span>'
-                    f'<span class="badge">out {v["output_tokens"]:,}</span>'
+                    f'<span class="badge">in {_fmt_tokens(v["input_tokens"])}</span>'
+                    f'<span class="badge">out {_fmt_tokens(v["output_tokens"])}</span>'
                     f'<span class="badge badge-green">${v["cost_usd"]:.4f}</span>'
                     f'</span></div>'
                 )
@@ -300,8 +306,8 @@ with tabs[0]:
                     f'<div class="model-row">'
                     f'<span style="max-width:40%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block">{m}</span>'
                     f'<span>'
-                    f'<span class="badge">in {inp:,}</span>'
-                    f'<span class="badge">out {out:,}</span>'
+                    f'<span class="badge">in {_fmt_tokens(inp)}</span>'
+                    f'<span class="badge">out {_fmt_tokens(out)}</span>'
                     f'<span class="badge">{reqs}r</span>'
                     f'<span class="badge badge-green">${cost:.4f}</span>'
                     f'</span></div>'
@@ -387,8 +393,8 @@ with tabs[0]:
                     f'<div class="model-row">'
                     f'<span>{m}</span>'
                     f'<span>'
-                    f'<span class="badge">in {inp:,}</span>'
-                    f'<span class="badge">out {out:,}</span>'
+                    f'<span class="badge">in {_fmt_tokens(inp)}</span>'
+                    f'<span class="badge">out {_fmt_tokens(out)}</span>'
                     f'</span></div>'
                 )
             last_computed = cc.get("last_computed", "")
@@ -512,9 +518,23 @@ with tabs[1]:
                     sys_rows += f'<div class="model-row"><span>Swap</span><span>{md.get("swap_used","0")} / {md.get("swap_total","0")}</span></div>'
             else:
                 sys_rows += f'<div class="model-row"><span>Mémoire</span><span>{health.get("memory","")}</span></div>'
-            sys_rows += (
-                f'<div class="model-row"><span>Disque</span><span>{health.get("disk","")}</span></div>'
-            )
+            disks = health.get("disks", [])
+            if disks:
+                for dk in disks:
+                    pct_num = int(dk["pct"].rstrip("%")) if dk.get("pct") else 0
+                    dk_clr = "green" if pct_num < 70 else ("yellow" if pct_num < 90 else "red")
+                    sys_rows += f'<div class="model-row"><span>Disque {dk.get("mount","")}</span><span class="{dk_clr}">{dk.get("used","?")} / {dk.get("total","?")} ({dk.get("pct","?")})</span></div>'
+            else:
+                sys_rows += f'<div class="model-row"><span>Disque</span><span>{health.get("disk","")}</span></div>'
+            # Network info
+            net = health.get("network", {})
+            if net:
+                pub_ip = net.get("public_ip", "")
+                if pub_ip:
+                    sys_rows += f'<div class="model-row"><span>IP publique</span><span>{pub_ip}</span></div>'
+                for iface in net.get("interfaces", []):
+                    if iface["type"] in ("lan", "vpn"):
+                        sys_rows += f'<div class="model-row"><span>{iface["iface"]}</span><span class="badge {"badge-green" if iface["type"]=="vpn" else "badge"}">{iface["addr"]}</span></div>'
             st.markdown(
                 f'<div class="card"><div class="card-header">🖥️ Système</div>{sys_rows}</div>',
                 unsafe_allow_html=True,
@@ -587,10 +607,12 @@ with tabs[1]:
                         rx = f'{p["rx_mb"]}MB↓' if p.get("rx_mb", 0) > 0 else ""
                         tx = f'{p["tx_mb"]}MB↑' if p.get("tx_mb", 0) > 0 else ""
                         ep = p.get("endpoint") or "no endpoint"
+                        ep_host = ep.split(":")[0] if ep != "no endpoint" else ""
                         dot = "🟢" if p.get("connected") else "🔴"
+                        hs_label = f'up {p["handshake"]}' if p.get("connected") else p["handshake"]
                         iface_rows += (
                             f'<div class="sub-num" style="margin-left:8px;margin-top:2px">'
-                            f'{dot} {p["pubkey_short"]} · {ep} · {p["handshake"]} · {rx} {tx}'
+                            f'{dot} {p["pubkey_short"]} · {ep_host} · {hs_label} · {rx} {tx}'
                             f'</div>'
                         )
                 st.markdown(
@@ -609,13 +631,16 @@ with tabs[1]:
             d_running = docker_counts.get("running", sum(1 for c in containers if "Up" in c.get("status","")))
             d_stopped = docker_counts.get("stopped", d_total - d_running)
             if containers or d_total > 0:
-                container_rows = "".join(
-                    f'<div class="model-row">'
-                    f'<span>{"🟢" if c.get("state","") == "running" or "Up" in c.get("status","") else "🔴"} {c.get("name","?")}</span>'
-                    f'<span class="sub-num">{str(c.get("status",""))[:40]}</span>'
-                    f'</div>'
-                    for c in containers
-                )
+                container_rows = ""
+                for c in containers:
+                    icon = "🟢" if c.get("state","") == "running" or "Up" in c.get("status","") else "🔴"
+                    port = f' :{c["main_port"]}' if c.get("main_port") else ""
+                    container_rows += (
+                        f'<div class="model-row">'
+                        f'<span>{icon} {c.get("name","?")}{port}</span>'
+                        f'<span class="sub-num">{str(c.get("status",""))[:35]}</span>'
+                        f'</div>'
+                    )
                 docker_header = f'🐳 Docker — {d_running}▲ {d_stopped}▼ / {d_total} total'
                 st.markdown(
                     f'<div class="card"><div class="card-header">{docker_header}</div>{container_rows}</div>',
@@ -722,9 +747,10 @@ with tabs[1]:
                     )
                     for s in sessions:
                         att = " · attached" if s.get("attached") else ""
+                        dur = f' · {s["duration"]}' if s.get("duration") else ""
                         dev_rows += (
                             f'<div class="sub-num" style="margin-top:2px">'
-                            f'• {s["name"]} · {s["windows"]} fenêtre(s){att}'
+                            f'• {s["name"]} · {s["windows"]} fenêtre(s){att}{dur}'
                             f'</div>'
                         )
                 st.markdown(

@@ -72,7 +72,30 @@ def collect_meta():
         "hostname":     hostname or "unknown",
         "uptime":       uptime_str or "",
         "kernel":       kernel or "",
-        "global_status": "ok",   # sera recalculé en fin de script
+        "global_status": "ok",
+    }
+
+
+def collect_network():
+    """Collect network interfaces, public IP, VPN IPs."""
+    public_ip, _, _ = run("curl -4 -s --max-time 5 ifconfig.me 2>/dev/null")
+    interfaces = []
+    ip_out, _, _ = run("ip -4 addr show")
+    for line in ip_out.splitlines():
+        line = line.strip()
+        if line.startswith("inet "):
+            parts = line.split()
+            addr = parts[1]  # e.g. 10.8.0.1/24
+            # find interface name (last word after "scope ... <iface>")
+            iface = parts[-1] if len(parts) > 1 else ""
+            ip_only = addr.split("/")[0]
+            if ip_only == "127.0.0.1":
+                continue
+            itype = "vpn" if iface.startswith("wg") else ("docker" if iface.startswith(("br-", "docker", "veth")) else "lan")
+            interfaces.append({"iface": iface, "addr": addr, "type": itype})
+    return {
+        "public_ip": public_ip.strip() if public_ip else "",
+        "interfaces": interfaces,
     }
 
 
@@ -96,15 +119,29 @@ def collect_resources():
     except Exception:
         ram_total = ram_used = ram_free = ram_pct = None
 
+    # Multi-disk support
+    disks = []
     try:
-        df_out, _, _ = run("df -h /")
-        df_line = [l for l in df_out.splitlines() if not l.startswith("Filesystem")][0].split()
-        disk_total = df_line[1]
-        disk_used  = df_line[2]
-        disk_avail = df_line[3]
-        disk_pct   = df_line[4]
+        df_out, _, _ = run("df -h --type=ext4 --type=xfs --type=btrfs --type=vfat 2>/dev/null || df -h")
+        for line in df_out.splitlines():
+            if line.startswith("/dev"):
+                parts = line.split()
+                if len(parts) >= 6:
+                    mount = parts[5]
+                    if mount.startswith("/boot") or mount.startswith("/snap"):
+                        continue
+                    disks.append({
+                        "device":  parts[0],
+                        "total":   parts[1],
+                        "used":    parts[2],
+                        "avail":   parts[3],
+                        "pct":     parts[4],
+                        "mount":   mount,
+                    })
     except Exception:
-        disk_total = disk_used = disk_avail = disk_pct = None
+        pass
+    # Compat: keep first disk as flat fields
+    d0 = disks[0] if disks else {}
 
     return {
         "load_1m":     load_1m,
@@ -114,10 +151,11 @@ def collect_resources():
         "ram_used_mb":  ram_used,
         "ram_free_mb":  ram_free,
         "ram_pct":      ram_pct,
-        "disk_total":  disk_total,
-        "disk_used":   disk_used,
-        "disk_avail":  disk_avail,
-        "disk_pct":    disk_pct,
+        "disk_total":  d0.get("total"),
+        "disk_used":   d0.get("used"),
+        "disk_avail":  d0.get("avail"),
+        "disk_pct":    d0.get("pct"),
+        "disks":       disks,
     }
 
 
@@ -131,12 +169,19 @@ def collect_docker():
                 continue
             try:
                 c = json.loads(line)
+                ports_raw = c.get("Ports", "")
+                # Extract first host-mapped port (e.g. "0.0.0.0:8888->8888/tcp" -> "8888")
+                main_port = ""
+                for pm in re.findall(r'(?:[\d.]+:)?(\d+)->\d+', ports_raw):
+                    main_port = pm
+                    break
                 containers.append({
-                    "name":   c.get("Names", c.get("Name", "")),
-                    "image":  c.get("Image", ""),
-                    "state":  c.get("State", ""),
-                    "status": c.get("Status", ""),
-                    "ports":  c.get("Ports", ""),
+                    "name":      c.get("Names", c.get("Name", "")),
+                    "image":     c.get("Image", ""),
+                    "state":     c.get("State", ""),
+                    "status":    c.get("Status", ""),
+                    "ports":     ports_raw,
+                    "main_port": main_port,
                 })
             except json.JSONDecodeError:
                 # Fallback parsing si le format JSON est partiel
@@ -357,18 +402,26 @@ def collect_github_auth():
         m2 = re.search(r'\(([A-Z_]+)\)', line)
         if m2:
             token_src = m2.group(1)
-    # Last push events
+    # Last push per repo (deduplicated)
     last_pushes = []
     if rc == 0 and account:
         push_out, _, push_rc = run(
-            f'gh api "/users/{account}/events?per_page=5" '
+            f'gh api "/users/{account}/events?per_page=30" '
             f'--jq \'[.[] | select(.type=="PushEvent") | '
-            f'{{repo: .repo.name, at: .created_at}}][0:3]\'',
+            f'{{repo: .repo.name, at: .created_at}}]\'',
             timeout=10,
         )
         if push_rc == 0 and push_out:
             try:
-                last_pushes = json.loads(push_out)
+                raw = json.loads(push_out)
+                seen_repos = set()
+                for p in raw:
+                    repo = p.get("repo", "")
+                    if repo not in seen_repos:
+                        seen_repos.add(repo)
+                        last_pushes.append(p)
+                    if len(last_pushes) >= 5:
+                        break
             except json.JSONDecodeError:
                 pass
 
@@ -385,6 +438,25 @@ def collect_tmux():
     out, err, rc = run("tmux ls 2>/dev/null")
     if rc != 0 or not out:
         return {"sessions": [], "count": 0, "status": "ok"}
+    # Get session creation times
+    created_out, _, _ = run("tmux list-sessions -F '#{session_name} #{session_created}' 2>/dev/null")
+    created_map = {}
+    import time as _time
+    now = _time.time()
+    for cl in (created_out or "").splitlines():
+        parts = cl.strip().split()
+        if len(parts) == 2:
+            try:
+                age = now - int(parts[1])
+                if age < 3600:
+                    dur = f"{int(age//60)}min"
+                elif age < 86400:
+                    dur = f"{int(age//3600)}h{int((age%3600)//60)}min"
+                else:
+                    dur = f"{int(age//86400)}d {int((age%86400)//3600)}h"
+                created_map[parts[0]] = dur
+            except ValueError:
+                pass
     sessions = []
     for line in out.splitlines():
         if ":" not in line:
@@ -392,7 +464,11 @@ def collect_tmux():
         name = line.split(":")[0].strip()
         m = re.search(r'(\d+) windows?', line)
         windows = int(m.group(1)) if m else 0
-        sessions.append({"name": name, "windows": windows, "attached": "(attached)" in line})
+        sessions.append({
+            "name": name, "windows": windows,
+            "attached": "(attached)" in line,
+            "duration": created_map.get(name, ""),
+        })
     return {"sessions": sessions, "count": len(sessions), "status": "ok"}
 
 
@@ -451,6 +527,7 @@ def _reuse_openclaw_from_sidecar():
 def build_report():
     meta      = collect_meta()
     resources = collect_resources()
+    network   = collect_network()
     docker    = collect_docker()
     watchtower = collect_watchtower()
     apt       = collect_apt()
@@ -478,6 +555,7 @@ def build_report():
     return {
         "meta":              meta,
         "resources":         resources,
+        "network":           network,
         "docker":            docker,
         "watchtower":        watchtower,
         "apt":               apt,

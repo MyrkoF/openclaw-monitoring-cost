@@ -222,11 +222,13 @@ def collect_system():
     if isinstance(doctor, list): doctor = "\n".join(doctor)
     if isinstance(audit, list):  audit  = "\n".join(audit)
 
-    # WireGuard, GitHub CLI, tmux, Claude Code
+    # WireGuard, GitHub CLI, tmux, Claude Code, Network
     wireguard   = sidecar.get("wireguard", {})
     github_cli  = sidecar.get("github_cli", {})
     tmux        = sidecar.get("tmux", {})
     claude_code = sidecar.get("claude_code", {})
+    network     = sidecar.get("network", {})
+    disks       = sidecar.get("resources", {}).get("disks", [])
 
     # Métadonnées sidecar
     meta       = sidecar.get("meta", {})
@@ -260,6 +262,8 @@ def collect_system():
         "github_cli":         github_cli,
         "tmux":               tmux,
         "claude_code":        claude_code,
+        "network":            network,
+        "disks":              disks,
         "sidecar_at":         sidecar_at,
         "sidecar_stale":      _is_stale(sidecar_at),
     }

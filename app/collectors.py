@@ -60,6 +60,18 @@ def _get_price(pricing_table, model):
 
 # ─── OpenClaw session file parser ─────────────────────────────────────────────
 
+def _parse_ts(ts_str):
+    """Parse ISO 8601 timestamp to naive UTC datetime."""
+    if not ts_str:
+        return None
+    try:
+        ts_str = ts_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(ts_str)
+        return dt.replace(tzinfo=None)  # strip tz for comparison with utcnow
+    except Exception:
+        return None
+
+
 def _parse_session_files(provider_filter_fn, days=30):
     """Parse OpenClaw session JSONL files and extract usage entries."""
     entries = []
@@ -79,6 +91,10 @@ def _parse_session_files(provider_filter_fn, days=30):
                     for line in f:
                         try:
                             entry = json.loads(line)
+                            ts = entry.get("timestamp", "")
+                            ts_dt = _parse_ts(ts)
+                            if ts_dt and ts_dt < since:
+                                continue
                             msg      = entry.get("message", {})
                             model    = str(msg.get("model") or entry.get("model", ""))
                             provider = str(msg.get("provider") or entry.get("provider", ""))
@@ -94,7 +110,6 @@ def _parse_session_files(provider_filter_fn, days=30):
                             cost = (usage.get("cost") or {}).get("total") or 0
                             if not (inp or out):
                                 continue
-                            ts = entry.get("timestamp", "")
                             entries.append({
                                 "model":         model,
                                 "provider":      provider,
