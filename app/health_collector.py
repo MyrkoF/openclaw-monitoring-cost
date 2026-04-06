@@ -61,6 +61,31 @@ def _proc_memory():
         return f"ERROR: {e}"
 
 
+def _proc_memory_detail():
+    try:
+        info = {}
+        for line in open("/proc/meminfo"):
+            p = line.split()
+            if len(p) >= 2:
+                info[p[0].rstrip(":")] = int(p[1])
+        def fmt(kb):
+            if kb >= 1024 * 1024: return f"{kb/1024/1024:.1f}G"
+            return f"{kb/1024:.0f}M"
+        total  = info.get("MemTotal", 0)
+        avail  = info.get("MemAvailable", 0)
+        used   = total - avail
+        swap_t = info.get("SwapTotal", 0)
+        swap_u = swap_t - info.get("SwapFree", 0)
+        return {
+            "ram_total": fmt(total), "ram_used": fmt(used), "ram_free": fmt(avail),
+            "ram_pct": round(used / total * 100) if total else 0,
+            "swap_used": fmt(swap_u) if swap_t else None,
+            "swap_total": fmt(swap_t) if swap_t else None,
+        }
+    except Exception:
+        return {}
+
+
 def _proc_disk():
     try:
         out = run("df -h /")
@@ -142,6 +167,7 @@ def collect_system():
     uptime, uptime_since = _proc_uptime()
     load      = run("cat /proc/loadavg")
     mem       = _proc_memory()
+    mem_detail = _proc_memory_detail()
     disk      = _proc_disk()
     cpu_pct   = _proc_cpu_percent()
     cpu_cores = run("nproc")
@@ -182,6 +208,7 @@ def collect_system():
     apt_updates   = apt_section.get("recent_lines", sidecar.get("apt_updates", []))
     apt_upgradable = apt_section.get("upgradable", [])
     apt_upgradable_count = apt_section.get("upgradable_count", len(apt_upgradable))
+    apt_timers    = apt_section.get("apt_timers", {})
 
     # Services
     services = sidecar.get("services", {})
@@ -195,10 +222,11 @@ def collect_system():
     if isinstance(doctor, list): doctor = "\n".join(doctor)
     if isinstance(audit, list):  audit  = "\n".join(audit)
 
-    # WireGuard, GitHub CLI, tmux
-    wireguard  = sidecar.get("wireguard", {})
-    github_cli = sidecar.get("github_cli", {})
-    tmux       = sidecar.get("tmux", {})
+    # WireGuard, GitHub CLI, tmux, Claude Code
+    wireguard   = sidecar.get("wireguard", {})
+    github_cli  = sidecar.get("github_cli", {})
+    tmux        = sidecar.get("tmux", {})
+    claude_code = sidecar.get("claude_code", {})
 
     # Métadonnées sidecar
     meta       = sidecar.get("meta", {})
@@ -211,6 +239,7 @@ def collect_system():
         "uptime_since":       uptime_since,
         "load":               load,
         "memory":             mem,
+        "memory_detail":      mem_detail,
         "disk":               disk,
         "cpu_cores":          cpu_cores,
         "cpu_percent":        cpu_pct,
@@ -222,6 +251,7 @@ def collect_system():
         "apt_updates":        apt_updates,
         "apt_upgradable":     apt_upgradable,
         "apt_upgradable_count": apt_upgradable_count,
+        "apt_timers":         apt_timers,
         "services":           services,
         "global_status":      global_status,
         "doctor":             doctor or "Lancer daily-health-check.py sur le host",
@@ -229,6 +259,7 @@ def collect_system():
         "wireguard":          wireguard,
         "github_cli":         github_cli,
         "tmux":               tmux,
+        "claude_code":        claude_code,
         "sidecar_at":         sidecar_at,
         "sidecar_stale":      _is_stale(sidecar_at),
     }

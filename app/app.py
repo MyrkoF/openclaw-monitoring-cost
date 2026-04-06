@@ -105,15 +105,24 @@ def load(days):
     return {
         "collected_at": datetime.utcnow().isoformat(),
         "providers": {
-            "openrouter": collect_openrouter(),
-            "openai":     collect_openai(),
+            "openrouter": collect_openrouter(days=days),
+            "openai":     collect_openai(days=days),
             "anthropic":  collect_anthropic(days=days),
-            "google":     collect_google(),
+            "google":     collect_google(days=days),
         }
     }
 
 data = load(period_days)
 p = data.get("providers", {})
+
+# Health data (shared between AI Costs and System Health tabs)
+_health = {}
+if os.path.exists(HEALTH_CACHE):
+    try:
+        with open(HEALTH_CACHE) as f:
+            _health = json.load(f)
+    except Exception:
+        pass
 
 
 # ── Header ─────────────────────────────────────────────────────────────────────
@@ -311,11 +320,6 @@ with tabs[0]:
                 unsafe_allow_html=True,
             )
 
-            if daily:
-                df_chart = pd.DataFrame(daily)
-                df_chart = df_chart[df_chart["cost_usd"] > 0]
-                if not df_chart.empty:
-                    st.line_chart(df_chart.set_index("date")["cost_usd"], height=70, use_container_width=True)
         else:
             st.markdown(
                 f'<div class="card">'
@@ -330,68 +334,77 @@ with tabs[0]:
     # ── Detail row 2 : Anthropic + Google ─────────────────────────
     col_ant, col_goo = st.columns(2)
 
-    # ── Anthropic ──────────────────────────────────────────────────
+    # ── Anthropic (API réelle) + Claude Code (stats locales) ─────
     with col_ant:
         d        = p.get("anthropic", {})
-        cost     = d.get("estimated_cost_usd", 0) or 0
-        inp_tot  = d.get("total_input_tokens", 0) or 0
-        out_tot  = d.get("total_output_tokens", 0) or 0
-        by_m     = d.get("by_model") or {}
         b_status = d.get("billing_status", "unavailable")
         b_rem    = d.get("credits_remaining_usd")
         b_tot    = d.get("credits_total_usd")
         b_used   = d.get("credits_used_usd")
         b_src    = d.get("billing_source", "none")
 
-        # Section billing API (si disponible)
+        # Card Anthropic API — seulement si billing réel disponible
         if b_status == "ok" and b_rem is not None and b_tot:
             b_pct = min((b_used or 0) / b_tot * 100, 100) if b_tot else 0
             b_clr = "green" if b_rem > 5 else ("yellow" if b_rem > 1 else "red")
             src_label = "Console API" if b_src == "console_key" else "Claude CLI"
-            billing_section = (
+            st.markdown(
+                f'<div class="card">'
+                f'<div class="card-header">🧠 Anthropic API</div>'
                 f'<div class="nums-row">'
                 f'<div class="info-block"><div class="big-num {b_clr}">${b_rem:.2f}</div><div class="sub-num">crédits restants</div></div>'
-                f'<div class="info-block"><div class="big-num">${b_used:.2f}</div><div class="sub-num">utilisé (prépayé)</div></div>'
-                f'<div class="info-block"><div class="big-num grey">${b_tot:.2f}</div><div class="sub-num">total prépayé</div></div>'
+                f'<div class="info-block"><div class="big-num">${b_used:.2f}</div><div class="sub-num">utilisé</div></div>'
+                f'<div class="info-block"><div class="big-num grey">${b_tot:.2f}</div><div class="sub-num">total</div></div>'
                 f'</div>'
                 f'<div class="prog-bar-bg"><div class="prog-bar-fill" style="width:{b_pct:.1f}%"></div></div>'
-                f'<div class="sub-num grey">{b_pct:.2f}% consommé · source: {src_label}</div>'
-                f'<hr class="divider">'
+                f'<div class="sub-num grey">{b_pct:.2f}% consommé · {src_label}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
             )
         else:
-            billing_section = ""
+            st.markdown(
+                f'<div class="card">'
+                f'<div class="card-header">🧠 Anthropic API</div>'
+                f'<div class="sub-num grey">Clé API requise (ANTHROPIC_API_KEY_MONITORING)</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
-        # Lignes par modèle depuis logs
-        model_rows = "".join(
-            f'<div class="model-row">'
-            f'<span>{m}</span>'
-            f'<span>'
-            f'<span class="badge">in {v["input_tokens"]:,}</span>'
-            f'<span class="badge">out {v["output_tokens"]:,}</span>'
-            f'<span class="badge badge-green">${v["cost_usd"]:.4f}</span>'
-            f'</span></div>'
-            for m, v in sorted(by_m.items(), key=lambda x: x[1].get("cost_usd", 0), reverse=True)
-        )
-        usage_section = (
-            f'<div class="nums-row">'
-            f'<div class="info-block"><div class="big-num yellow">${cost:.4f}</div><div class="sub-num">estimé ({period})</div></div>'
-            f'<div class="info-block"><div class="big-num grey">{inp_tot:,}</div><div class="sub-num">tokens in</div></div>'
-            f'<div class="info-block"><div class="big-num grey">{out_tot:,}</div><div class="sub-num">tokens out</div></div>'
-            f'</div>'
-        )
-        model_divider = '<hr class="divider">' if model_rows else ""
-        note = "" if b_status == "ok" else '<div class="sub-num grey" style="margin-top:6px">⚠️ Billing API non configuré — estimation depuis logs OpenClaw</div>'
-
-        st.markdown(
-            f'<div class="card">'
-            f'<div class="card-header">🧠 Anthropic</div>'
-            f'{billing_section}'
-            f'{usage_section}'
-            f'{model_divider}{model_rows}'
-            f'{note}'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
+        # Card Claude Code — stats locales depuis sidecar
+        cc = _health.get("claude_code", {})
+        if cc.get("status") == "ok":
+            sub_type = (cc.get("subscription_type") or "?").upper()
+            tier     = cc.get("rate_limit_tier", "")
+            tier_short = tier.replace("default_claude_", "").replace("_", " ") if tier else ""
+            sessions = cc.get("total_sessions", 0)
+            messages = cc.get("total_messages", 0)
+            model_usage = cc.get("model_usage", {})
+            cc_rows = ""
+            for m, v in model_usage.items():
+                inp = v.get("inputTokens", 0) + v.get("cacheReadInputTokens", 0) + v.get("cacheCreationInputTokens", 0)
+                out = v.get("outputTokens", 0)
+                cc_rows += (
+                    f'<div class="model-row">'
+                    f'<span>{m}</span>'
+                    f'<span>'
+                    f'<span class="badge">in {inp:,}</span>'
+                    f'<span class="badge">out {out:,}</span>'
+                    f'</span></div>'
+                )
+            last_computed = cc.get("last_computed", "")
+            st.markdown(
+                f'<div class="card">'
+                f'<div class="card-header">🤖 Claude Code <span class="badge badge-green" style="margin-left:auto">{sub_type}</span></div>'
+                f'<div class="nums-row">'
+                f'<div class="info-block"><div class="big-num">{sessions}</div><div class="sub-num">sessions</div></div>'
+                f'<div class="info-block"><div class="big-num">{messages}</div><div class="sub-num">messages</div></div>'
+                f'<div class="info-block"><div class="big-num grey">{tier_short}</div><div class="sub-num">tier</div></div>'
+                f'</div>'
+                f'{cc_rows}'
+                f'<div class="sub-num grey" style="margin-top:4px">Stats CLI locales · màj {last_computed}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
     # ── Google Gemini ───────────────────────────────────────────────
     with col_goo:
@@ -461,13 +474,7 @@ with tabs[0]:
 # ══════════════════════════════════════════════════════════════════
 with tabs[1]:
 
-    health = {}
-    if os.path.exists(HEALTH_CACHE):
-        try:
-            with open(HEALTH_CACHE) as f:
-                health = json.load(f)
-        except Exception:
-            pass
+    health = _health
 
     ts          = health.get("collected_at", "")
     sidecar_ts  = health.get("sidecar_at", "")
@@ -492,7 +499,20 @@ with tabs[1]:
                 f'<div class="model-row"><span>Load avg</span><span>{health.get("load","")}</span></div>'
                 f'<div class="model-row"><span>CPU cores</span><span>{health.get("cpu_cores","")}</span></div>'
                 f'<div class="model-row"><span>CPU %</span><span>{health.get("cpu_percent","")}</span></div>'
-                f'<div class="model-row"><span>Mémoire</span><span>{health.get("memory","")}</span></div>'
+            )
+            md = health.get("memory_detail", {})
+            if md:
+                ram_pct = md.get("ram_pct", 0)
+                ram_clr = "green" if ram_pct < 70 else ("yellow" if ram_pct < 90 else "red")
+                sys_rows += (
+                    f'<div class="model-row"><span>RAM</span><span class="{ram_clr}">{md.get("ram_used","?")} / {md.get("ram_total","?")} ({ram_pct}%)</span></div>'
+                    f'<div class="prog-bar-bg"><div class="prog-bar-fill" style="width:{ram_pct}%;background:{"#48bb78" if ram_pct < 70 else ("#ecc94b" if ram_pct < 90 else "#fc8181")}"></div></div>'
+                )
+                if md.get("swap_total"):
+                    sys_rows += f'<div class="model-row"><span>Swap</span><span>{md.get("swap_used","0")} / {md.get("swap_total","0")}</span></div>'
+            else:
+                sys_rows += f'<div class="model-row"><span>Mémoire</span><span>{health.get("memory","")}</span></div>'
+            sys_rows += (
                 f'<div class="model-row"><span>Disque</span><span>{health.get("disk","")}</span></div>'
             )
             st.markdown(
@@ -503,23 +523,46 @@ with tabs[1]:
             # Apt updates card
             pkgs            = health.get("apt_updates", [])
             upgradable_cnt  = health.get("apt_upgradable_count", 0)
+            upgradable_list = health.get("apt_upgradable", [])
+            apt_timers      = health.get("apt_timers", {})
             apt_clr         = "yellow" if upgradable_cnt > 10 else ("yellow" if pkgs else "green")
-            apt_rows = "".join(
-                f'<div class="sub-num" style="margin-top:2px">{x[-80:]}</div>'
-                for x in pkgs[-5:]
-            )
+            # Format recent dpkg lines: extract package name + version
+            apt_rows = ""
+            for x in pkgs[-5:]:
+                parts = x.split()
+                if len(parts) >= 4:
+                    date_str = parts[0] if parts[0].startswith("20") else ""
+                    action = next((p for p in parts if p in ("install", "upgrade", "remove")), "")
+                    pkg = parts[3] if len(parts) > 3 else x
+                    pkg_short = pkg.split(":")[0] if ":" in pkg else pkg
+                    apt_rows += f'<div class="sub-num" style="margin-top:2px">{date_str} {action} <b>{pkg_short}</b></div>'
+                else:
+                    apt_rows += f'<div class="sub-num" style="margin-top:2px">{x[-60:]}</div>'
             upgradable_badge = (
                 f'<span class="badge {"badge" if upgradable_cnt <= 10 else ""}" '
                 f'style="{"color:#fc8181" if upgradable_cnt > 10 else ""}">'
                 f'{upgradable_cnt} upgradable</span>'
                 if upgradable_cnt else ""
             )
+            # Timer info
+            timer_row = ""
+            if apt_timers.get("next_upgrade"):
+                timer_row = f'<div class="sub-num" style="margin-top:4px">⏱ Prochain upgrade auto : {apt_timers.get("left_upgrade", "")} ({apt_timers["next_upgrade"]})</div>'
+            # Upgradable packages list
+            upg_rows = ""
+            for pkg in upgradable_list[:8]:
+                pkg_name = pkg.split("/")[0] if "/" in pkg else pkg
+                upg_rows += f'<div class="sub-num" style="margin-top:1px">• {pkg_name}</div>'
+            if len(upgradable_list) > 8:
+                upg_rows += f'<div class="sub-num grey">… et {len(upgradable_list) - 8} autres</div>'
             st.markdown(
                 f'<div class="card">'
-                f'<div class="card-header">📦 Apt updates (24h) {upgradable_badge}</div>'
+                f'<div class="card-header">📦 APT {upgradable_badge}</div>'
                 f'<div class="big-num {apt_clr}">{len(pkgs)}</div>'
                 f'<div class="sub-num">package(s) mis à jour récemment</div>'
                 f'{apt_rows}'
+                f'{"<hr class=\"divider\">" + upg_rows if upg_rows else ""}'
+                f'{timer_row}'
                 f'</div>',
                 unsafe_allow_html=True,
             )
@@ -601,12 +644,21 @@ with tabs[1]:
                 f'<span class="badge" style="color:#fc8181">⚠️ {len(wt_errors)} erreur(s)</span>'
                 if wt_errors else ""
             )
-            wt_rows = "".join(
-                f'<div class="sub-num" style="margin-top:2px">{x[-80:]}</div>'
-                for x in wt[-5:]
-            )
+            wt_rows = ""
+            for x in wt[-5:]:
+                # Parse watchtower log: extract key info
+                import re as _re
+                m = _re.search(r'msg="([^"]+)"', x)
+                msg = m.group(1) if m else x[-60:]
+                # Extract counts
+                parts = []
+                for kv in _re.findall(r'(\w+)=(\d+)', x):
+                    if kv[0] in ("scanned", "updated", "failed") and kv[1] != "0":
+                        parts.append(f'{kv[0]}={kv[1]}')
+                extra = f' ({", ".join(parts)})' if parts else ""
+                wt_rows += f'<div class="sub-num" style="margin-top:2px">{msg}{extra}</div>'
             err_rows = "".join(
-                f'<div class="sub-num" style="color:#fc8181;margin-top:2px">{x[-80:]}</div>'
+                f'<div class="sub-num" style="color:#fc8181;margin-top:2px">{x[-60:]}</div>'
                 for x in wt_errors[-3:]
             )
             st.markdown(
@@ -622,14 +674,19 @@ with tabs[1]:
             # Services card
             services = health.get("services", {})
             if services:
-                service_rows = "".join(
-                    f'<div class="model-row">'
-                    f'<span>{svc}</span>'
-                    f'<span class="badge {"badge-green" if st_ == "active" else "badge"}" '
-                    f'style="{"" if st_ == "active" else "color:#fc8181"}">{st_}</span>'
-                    f'</div>'
-                    for svc, st_ in services.items()
-                )
+                service_rows = ""
+                for svc, st_ in services.items():
+                    is_active = st_ in ("active", "active (docker)")
+                    badge_cls = "badge-green" if is_active else "badge"
+                    style = "" if is_active else "color:#fc8181"
+                    docker_tag = ' <span class="badge badge-blue">docker</span>' if "(docker)" in st_ else ""
+                    label = "active" if is_active else st_
+                    service_rows += (
+                        f'<div class="model-row">'
+                        f'<span>{svc}{docker_tag}</span>'
+                        f'<span class="badge {badge_cls}" style="{style}">{label}</span>'
+                        f'</div>'
+                    )
                 st.markdown(
                     f'<div class="card"><div class="card-header">⚙️ Services</div>{service_rows}</div>',
                     unsafe_allow_html=True,
@@ -650,6 +707,10 @@ with tabs[1]:
                         f'<span class="badge {gh_clr}">{gh_label}{gh_src}</span>'
                         f'</div>'
                     )
+                    for push in gh.get("last_pushes", []):
+                        repo = push.get("repo", "").split("/")[-1] if "/" in push.get("repo", "") else push.get("repo", "")
+                        at = push.get("at", "")[:16].replace("T", " ")
+                        dev_rows += f'<div class="sub-num" style="margin-left:8px;margin-top:1px">↑ {repo} · {at}</div>'
                 if tmx:
                     sessions = tmx.get("sessions", [])
                     tmx_label = f'{len(sessions)} session(s)' if sessions else "aucune"

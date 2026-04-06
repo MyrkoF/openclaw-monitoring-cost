@@ -187,12 +187,31 @@ def collect_apt():
     except Exception:
         upgradable = []
 
+    # APT auto-update timers
+    apt_timers = {}
+    try:
+        timer_out, _, _ = run("systemctl list-timers apt-daily.timer apt-daily-upgrade.timer --no-pager 2>/dev/null")
+        for line in (timer_out or "").splitlines():
+            if "apt-daily-upgrade" in line:
+                m = re.match(r'(\S+ \S+ \S+ \S+)\s+(\S+)\s', line)
+                if m:
+                    apt_timers["next_upgrade"] = m.group(1)
+                    apt_timers["left_upgrade"] = m.group(2)
+            elif "apt-daily.timer" in line or "apt-daily.service" in line:
+                m = re.match(r'(\S+ \S+ \S+ \S+)\s+(\S+)\s', line)
+                if m:
+                    apt_timers["next_check"] = m.group(1)
+                    apt_timers["left_check"] = m.group(2)
+    except Exception:
+        pass
+
     return {
-        "recent_lines":    recent[-50:],   # garder les 50 dernières
+        "recent_lines":    recent[-50:],
         "install_count":   len(installs),
         "upgrade_count":   len(upgrades),
         "upgradable":      upgradable,
         "upgradable_count": len(upgradable),
+        "apt_timers":      apt_timers,
     }
 
 
@@ -256,11 +275,21 @@ def collect_openclaw_security():
     }
 
 
-def collect_services():
+def collect_services(docker_data=None):
+    docker_containers = (docker_data or {}).get("containers", [])
     result = {}
     for svc in SERVICES_TO_CHECK:
         out, _, code = run(f"systemctl is-active {svc} 2>/dev/null")
-        result[svc] = out.strip() if out.strip() else ("active" if code == 0 else "inactive")
+        status = out.strip() if out.strip() else ("active" if code == 0 else "inactive")
+        if status != "active" and docker_containers:
+            for c in docker_containers:
+                cname  = (c.get("name", "") or "").lower()
+                cimage = (c.get("image", "") or "").lower()
+                if svc.lower() in cname or svc.lower() in cimage:
+                    if c.get("state") == "running":
+                        status = "active (docker)"
+                    break
+        result[svc] = status
     return result
 
 
@@ -284,7 +313,10 @@ def collect_wireguard():
             hs_str = ("never" if hs == 0
                       else f"{hs}s ago" if hs < 180
                       else f"{hs//60}min ago" if hs < 3600
-                      else f"{hs//3600}h ago")
+                      else f"{hs//3600}h ago" if hs < 86400
+                      else f"{hs//86400}d ago" if hs < 604800
+                      else f"{hs//604800}w ago" if hs < 2592000
+                      else "stale")
             interfaces[iface]["peers"].append({
                 "pubkey_short": pubkey[:8] + "…",
                 "endpoint":     endpoint if endpoint != "(none)" else None,
@@ -325,10 +357,26 @@ def collect_github_auth():
         m2 = re.search(r'\(([A-Z_]+)\)', line)
         if m2:
             token_src = m2.group(1)
+    # Last push events
+    last_pushes = []
+    if rc == 0 and account:
+        push_out, _, push_rc = run(
+            f'gh api "/users/{account}/events?per_page=5" '
+            f'--jq \'[.[] | select(.type=="PushEvent") | '
+            f'{{repo: .repo.name, at: .created_at}}][0:3]\'',
+            timeout=10,
+        )
+        if push_rc == 0 and push_out:
+            try:
+                last_pushes = json.loads(push_out)
+            except json.JSONDecodeError:
+                pass
+
     return {
         "authenticated": rc == 0,
         "account":       account,
         "token_source":  token_src,
+        "last_pushes":   last_pushes,
         "status":        "ok" if rc == 0 else "error",
     }
 
@@ -346,6 +394,41 @@ def collect_tmux():
         windows = int(m.group(1)) if m else 0
         sessions.append({"name": name, "windows": windows, "attached": "(attached)" in line})
     return {"sessions": sessions, "count": len(sessions), "status": "ok"}
+
+
+def collect_claude_code():
+    """Collect Claude Code CLI stats from ~/.claude/"""
+    claude_home = Path.home() / ".claude"
+    result = {"status": "unavailable"}
+
+    stats_path = claude_home / "stats-cache.json"
+    if stats_path.exists():
+        try:
+            stats = json.loads(stats_path.read_text(encoding="utf-8"))
+            result.update({
+                "status":          "ok",
+                "last_computed":   stats.get("lastComputedDate"),
+                "model_usage":     stats.get("modelUsage", {}),
+                "daily_tokens":    stats.get("dailyModelTokens", [])[-14:],
+                "total_sessions":  stats.get("totalSessions", 0),
+                "total_messages":  stats.get("totalMessages", 0),
+            })
+        except Exception:
+            pass
+
+    creds_path = claude_home / ".credentials.json"
+    if creds_path.exists():
+        try:
+            creds = json.loads(creds_path.read_text(encoding="utf-8"))
+            oauth = creds.get("claudeAiOauth", {})
+            result.update({
+                "subscription_type": oauth.get("subscriptionType"),
+                "rate_limit_tier":   oauth.get("rateLimitTier"),
+            })
+        except Exception:
+            pass
+
+    return result
 
 
 # ── Assemblage ─────────────────────────────────────────────────────────────────
@@ -371,10 +454,11 @@ def build_report():
     docker    = collect_docker()
     watchtower = collect_watchtower()
     apt       = collect_apt()
-    services  = collect_services()
-    wireguard = collect_wireguard()
+    services  = collect_services(docker_data=docker)
+    wireguard  = collect_wireguard()
     github_cli = collect_github_auth()
-    tmux      = collect_tmux()
+    tmux       = collect_tmux()
+    claude_code = collect_claude_code()
 
     # OpenClaw checks : réutiliser le sidecar si < 1h (économise ~7s)
     cached_doc, cached_sec = _reuse_openclaw_from_sidecar()
@@ -403,6 +487,7 @@ def build_report():
         "wireguard":         wireguard,
         "github_cli":        github_cli,
         "tmux":              tmux,
+        "claude_code":       claude_code,
     }
 
 

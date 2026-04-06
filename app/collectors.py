@@ -112,7 +112,7 @@ def _parse_session_files(provider_filter_fn, days=30):
 
 # ─── OpenRouter ────────────────────────────────────────────────────────────────
 
-def collect_openrouter():
+def collect_openrouter(days=30):
     if not OPENROUTER_API_KEY:
         return {"provider": "openrouter", "status": "no_key", "data": None}
     try:
@@ -128,7 +128,8 @@ def collect_openrouter():
 
         # Coût par modèle depuis les logs OpenClaw (provider = openrouter)
         entries = _parse_session_files(
-            lambda m, prov: "openrouter" in prov.lower()
+            lambda m, prov: "openrouter" in prov.lower(),
+            days=days,
         )
         by_model = {}
         for e in entries:
@@ -157,12 +158,12 @@ def collect_openrouter():
 
 # ─── OpenAI ────────────────────────────────────────────────────────────────────
 
-def collect_openai():
+def collect_openai(days=30):
     if not OPENAI_API_KEY:
         return {"provider": "openai", "status": "no_key", "data": None}
     hdrs = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     try:
-        start_time = int((datetime.utcnow() - timedelta(days=30)).timestamp())
+        start_time = int((datetime.utcnow() - timedelta(days=days)).timestamp())
 
         # 1. Coûts journaliers
         r_costs = httpx.get(
@@ -472,7 +473,7 @@ def _collect_google_billing():
         return {"billing_status": f"error: {str(e)[:80]}"}
 
 
-def collect_google():
+def collect_google(days=30):
     """
     Google Gemini — log parsing + Cloud Billing API si service account configuré.
     """
@@ -482,7 +483,7 @@ def collect_google():
         m = model.lower()
         return "gemini" in m or ("google" in m and "gemini" in m)
 
-    entries = _parse_session_files(is_google_direct)
+    entries = _parse_session_files(is_google_direct, days=days)
 
     by_model = {}
     for e in entries:
