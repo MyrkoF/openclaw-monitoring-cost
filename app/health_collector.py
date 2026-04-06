@@ -195,6 +195,11 @@ def collect_system():
     if isinstance(doctor, list): doctor = "\n".join(doctor)
     if isinstance(audit, list):  audit  = "\n".join(audit)
 
+    # WireGuard, GitHub CLI, tmux
+    wireguard  = sidecar.get("wireguard", {})
+    github_cli = sidecar.get("github_cli", {})
+    tmux       = sidecar.get("tmux", {})
+
     # Métadonnées sidecar
     meta       = sidecar.get("meta", {})
     sidecar_at = meta.get("collected_at", sidecar.get("collected_at", ""))
@@ -221,6 +226,9 @@ def collect_system():
         "global_status":      global_status,
         "doctor":             doctor or "Lancer daily-health-check.py sur le host",
         "security_audit":     audit  or "Lancer daily-health-check.py sur le host",
+        "wireguard":          wireguard,
+        "github_cli":         github_cli,
+        "tmux":               tmux,
         "sidecar_at":         sidecar_at,
         "sidecar_stale":      _is_stale(sidecar_at),
     }

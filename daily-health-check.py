@@ -15,6 +15,7 @@ import os
 import shlex
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
@@ -263,7 +264,106 @@ def collect_services():
     return result
 
 
+def collect_wireguard():
+    """Parse `wg show all dump` (tab-separated). Tente sans sudo puis avec."""
+    out, err, rc = run("wg show all dump 2>/dev/null || sudo wg show all dump 2>/dev/null")
+    if not out:
+        return {"interfaces": [], "total_peers": 0, "connected_peers": 0, "status": "unavailable"}
+
+    interfaces = {}
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 5:             # ligne interface
+            iface = parts[0]
+            interfaces[iface] = {"port": parts[3], "peers": []}
+        elif len(parts) == 9:           # ligne peer
+            iface, pubkey, _, endpoint, allowed_ips, last_hs, rx, tx, _ = parts
+            if iface not in interfaces:
+                interfaces[iface] = {"port": "?", "peers": []}
+            hs = int(last_hs)
+            hs_str = ("never" if hs == 0
+                      else f"{hs}s ago" if hs < 180
+                      else f"{hs//60}min ago" if hs < 3600
+                      else f"{hs//3600}h ago")
+            interfaces[iface]["peers"].append({
+                "pubkey_short": pubkey[:8] + "…",
+                "endpoint":     endpoint if endpoint != "(none)" else None,
+                "allowed_ips":  allowed_ips,
+                "handshake":    hs_str,
+                "rx_mb":        round(int(rx) / 1_048_576, 1),
+                "tx_mb":        round(int(tx) / 1_048_576, 1),
+                "connected":    0 < hs < 300,
+            })
+
+    iface_list = []
+    for name, d in interfaces.items():
+        connected = sum(1 for p in d["peers"] if p["connected"])
+        iface_list.append({
+            "name":            name,
+            "port":            d["port"],
+            "peers_total":     len(d["peers"]),
+            "peers_connected": connected,
+            "peers":           d["peers"],
+        })
+
+    return {
+        "interfaces":      iface_list,
+        "total_peers":     sum(i["peers_total"]     for i in iface_list),
+        "connected_peers": sum(i["peers_connected"] for i in iface_list),
+        "status":          "ok" if iface_list else "unavailable",
+    }
+
+
+def collect_github_auth():
+    out, err, rc = run("gh auth status 2>&1", timeout=10)
+    combined = (out + "\n" + err).strip()
+    account, token_src = "", ""
+    for line in combined.splitlines():
+        m = re.search(r'account (\S+)', line)
+        if m:
+            account = m.group(1).strip("()")
+        m2 = re.search(r'\(([A-Z_]+)\)', line)
+        if m2:
+            token_src = m2.group(1)
+    return {
+        "authenticated": rc == 0,
+        "account":       account,
+        "token_source":  token_src,
+        "status":        "ok" if rc == 0 else "error",
+    }
+
+
+def collect_tmux():
+    out, err, rc = run("tmux ls 2>/dev/null")
+    if rc != 0 or not out:
+        return {"sessions": [], "count": 0, "status": "ok"}
+    sessions = []
+    for line in out.splitlines():
+        if ":" not in line:
+            continue
+        name = line.split(":")[0].strip()
+        m = re.search(r'(\d+) windows?', line)
+        windows = int(m.group(1)) if m else 0
+        sessions.append({"name": name, "windows": windows, "attached": "(attached)" in line})
+    return {"sessions": sessions, "count": len(sessions), "status": "ok"}
+
+
 # ── Assemblage ─────────────────────────────────────────────────────────────────
+
+def _reuse_openclaw_from_sidecar():
+    """Réutilise les résultats openclaw du sidecar s'ils ont moins d'1 heure."""
+    try:
+        data = json.loads(SIDECAR_PATH.read_text(encoding="utf-8"))
+        ts = data.get("meta", {}).get("collected_at", "")
+        if not ts:
+            return None, None
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(ts)).total_seconds()
+        if age < 3600:
+            return data.get("openclaw_doctor"), data.get("openclaw_security")
+    except Exception:
+        pass
+    return None, None
+
 
 def build_report():
     meta      = collect_meta()
@@ -271,14 +371,21 @@ def build_report():
     docker    = collect_docker()
     watchtower = collect_watchtower()
     apt       = collect_apt()
-    doctor    = collect_openclaw_doctor()
-    security  = collect_openclaw_security()
     services  = collect_services()
+    wireguard = collect_wireguard()
+    github_cli = collect_github_auth()
+    tmux      = collect_tmux()
+
+    # OpenClaw checks : réutiliser le sidecar si < 1h (économise ~7s)
+    cached_doc, cached_sec = _reuse_openclaw_from_sidecar()
+    doctor   = cached_doc  or collect_openclaw_doctor()
+    security = cached_sec  or collect_openclaw_security()
 
     # Calcul du statut global
     global_status = _calc_status(
         doctor["status"],
         security["status"],
+        wireguard["status"],
         "warn" if watchtower.get("errors") else "ok",
         "warn" if apt["upgradable_count"] > 10 else "ok",
     )
@@ -293,6 +400,9 @@ def build_report():
         "openclaw_doctor":   doctor,
         "openclaw_security": security,
         "services":          services,
+        "wireguard":         wireguard,
+        "github_cli":        github_cli,
+        "tmux":              tmux,
     }
 
 

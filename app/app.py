@@ -524,6 +524,40 @@ with tabs[1]:
                 unsafe_allow_html=True,
             )
 
+            # WireGuard card
+            wg = health.get("wireguard", {})
+            if wg.get("interfaces"):
+                total_c = wg.get("connected_peers", 0)
+                total_p = wg.get("total_peers", 0)
+                wg_clr  = "green" if total_c == total_p and total_p > 0 else ("yellow" if total_c > 0 else "red")
+                iface_rows = ""
+                for iface in wg["interfaces"]:
+                    c = iface["peers_connected"]; t = iface["peers_total"]
+                    badge_clr = "badge-green" if c == t and t > 0 else "badge"
+                    iface_rows += (
+                        f'<div class="model-row">'
+                        f'<span><b>{iface["name"]}</b> :{iface["port"]}</span>'
+                        f'<span class="badge {badge_clr}">{c}/{t} peers</span>'
+                        f'</div>'
+                    )
+                    for p in iface["peers"]:
+                        rx = f'{p["rx_mb"]}MB↓' if p.get("rx_mb", 0) > 0 else ""
+                        tx = f'{p["tx_mb"]}MB↑' if p.get("tx_mb", 0) > 0 else ""
+                        ep = p.get("endpoint") or "no endpoint"
+                        dot = "🟢" if p.get("connected") else "🔴"
+                        iface_rows += (
+                            f'<div class="sub-num" style="margin-left:8px;margin-top:2px">'
+                            f'{dot} {p["pubkey_short"]} · {ep} · {p["handshake"]} · {rx} {tx}'
+                            f'</div>'
+                        )
+                st.markdown(
+                    f'<div class="card">'
+                    f'<div class="card-header">🔒 WireGuard — {total_c}/{total_p} actifs</div>'
+                    f'{iface_rows}'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
         with c2:
             # Docker containers card
             containers    = health.get("docker_containers", [])
@@ -598,6 +632,42 @@ with tabs[1]:
                 )
                 st.markdown(
                     f'<div class="card"><div class="card-header">⚙️ Services</div>{service_rows}</div>',
+                    unsafe_allow_html=True,
+                )
+
+            # DevTools card
+            gh  = health.get("github_cli", {})
+            tmx = health.get("tmux", {})
+            if gh or tmx:
+                dev_rows = ""
+                if gh:
+                    gh_clr   = "badge-green" if gh.get("authenticated") else "badge"
+                    gh_label = gh.get("account") or "non authentifié"
+                    gh_src   = f' · {gh["token_source"]}' if gh.get("token_source") else ""
+                    dev_rows += (
+                        f'<div class="model-row">'
+                        f'<span>GitHub CLI</span>'
+                        f'<span class="badge {gh_clr}">{gh_label}{gh_src}</span>'
+                        f'</div>'
+                    )
+                if tmx:
+                    sessions = tmx.get("sessions", [])
+                    tmx_label = f'{len(sessions)} session(s)' if sessions else "aucune"
+                    dev_rows += (
+                        f'<div class="model-row">'
+                        f'<span>tmux</span>'
+                        f'<span class="badge">{tmx_label}</span>'
+                        f'</div>'
+                    )
+                    for s in sessions:
+                        att = " · attached" if s.get("attached") else ""
+                        dev_rows += (
+                            f'<div class="sub-num" style="margin-top:2px">'
+                            f'• {s["name"]} · {s["windows"]} fenêtre(s){att}'
+                            f'</div>'
+                        )
+                st.markdown(
+                    f'<div class="card"><div class="card-header">🛠️ DevTools</div>{dev_rows}</div>',
                     unsafe_allow_html=True,
                 )
 
