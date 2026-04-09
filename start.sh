@@ -1,48 +1,34 @@
 #!/usr/bin/env bash
 # start.sh — Lance le container monitoring en injectant les clés depuis OpenClaw.
-# Les clés monitoring sont dans openclaw.json env.vars avec suffixe _MONITORING.
+# Les clés sont dans ~/.openclaw/.env
 # Jamais de clés en dur ici.
 
 set -e
 
-OPENCLAW_JSON="${HOME}/.openclaw/openclaw.json"
+OPENCLAW_ENV="${HOME}/.openclaw/.env"
 
-if [ ! -f "$OPENCLAW_JSON" ]; then
-  echo "❌ openclaw.json introuvable"
+if [ ! -f "$OPENCLAW_ENV" ]; then
+  echo "❌ ~/.openclaw/.env introuvable"
   exit 1
 fi
 
-# Clés dédiées monitoring (distinctes des clés prod)
-export OPENAI_API_KEY_MONITORING=$(python3 -c "
-import json
-d = json.load(open('$OPENCLAW_JSON'))
-print(d['env']['vars'].get('OPENAI_API_KEY_MONITORING', ''))
-" 2>/dev/null)
+# Charger les clés depuis le .env OpenClaw
+set -a
+source "$OPENCLAW_ENV"
+set +a
 
-export OPENROUTER_API_KEY_MONITORING=$(python3 -c "
-import json
-d = json.load(open('$OPENCLAW_JSON'))
-print(d['env']['vars'].get('OPENROUTER_API_KEY_MONITORING', ''))
-" 2>/dev/null)
-
-export ANTHROPIC_API_KEY_MONITORING=$(python3 -c "
-import json
-d = json.load(open('$OPENCLAW_JSON'))
-print(d['env']['vars'].get('ANTHROPIC_API_KEY_MONITORING', ''))
-" 2>/dev/null)
-
-export GOOGLE_API_KEY=$(python3 -c "
-import json
-d = json.load(open('$OPENCLAW_JSON'))
-print(d['env']['vars'].get('GOOGLE_PLACES_API_KEY', ''))
-" 2>/dev/null)
+# Mapping vers les noms attendus par docker-compose.yml
+export OPENAI_API_KEY_MONITORING
+export OPENROUTER_API_KEY_MONITORING
+export ANTHROPIC_API_KEY_MONITORING
+export GOOGLE_API_KEY="${GEMINI_API_KEY:-}"
 
 export DB_PATH="/data/monitoring.db"
 export OPENCLAW_LOGS_DIR="/openclaw-logs"
 export OPENCLAW_SESSIONS_DIR="/openclaw-sessions"
 
 echo "🔑 Clés monitoring chargées depuis OpenClaw :"
-echo "   OpenAI Admin  : ${OPENAI_API_KEY_MONITORING:0:20}..."
+echo "   OpenAI Mon    : ${OPENAI_API_KEY_MONITORING:0:20}..."
 echo "   OpenRouter Mon: ${OPENROUTER_API_KEY_MONITORING:0:20}..."
 echo "   Anthropic Mon : ${ANTHROPIC_API_KEY_MONITORING:0:20}..."
 

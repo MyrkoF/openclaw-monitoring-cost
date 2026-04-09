@@ -13,6 +13,7 @@ import subprocess
 import json
 import os
 import shlex
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 import re
@@ -187,14 +188,29 @@ def collect_docker():
                 # Fallback parsing si le format JSON est partiel
                 pass
         running = sum(1 for c in containers if c.get("state") == "running")
+        docker_stats = []
+        stats_out, _, _ = run(
+            'docker stats --no-stream --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}"',
+            timeout=15
+        )
+        if stats_out:
+            rows = []
+            for line in stats_out.splitlines():
+                p = line.split("\t")
+                if len(p) >= 3:
+                    rows.append({"name": p[0], "cpu_pct": p[1],
+                                 "mem_usage": p[2], "mem_pct": p[3] if len(p) > 3 else ""})
+            rows.sort(key=lambda x: float(x["cpu_pct"].rstrip("%") or 0), reverse=True)
+            docker_stats = rows[:5]
         return {
-            "containers": containers,
-            "total":      len(containers),
-            "running":    running,
-            "stopped":    len(containers) - running,
+            "containers":   containers,
+            "total":        len(containers),
+            "running":      running,
+            "stopped":      len(containers) - running,
+            "docker_stats": docker_stats,
         }
     except Exception as e:
-        return {"containers": [], "total": 0, "running": 0, "stopped": 0, "error": str(e)}
+        return {"containers": [], "total": 0, "running": 0, "stopped": 0, "docker_stats": [], "error": str(e)}
 
 
 def collect_watchtower():
@@ -354,8 +370,9 @@ def collect_wireguard():
             iface, pubkey, _, endpoint, allowed_ips, last_hs, rx, tx, _ = parts
             if iface not in interfaces:
                 interfaces[iface] = {"port": "?", "peers": []}
-            hs = int(last_hs)
-            hs_str = ("never" if hs == 0
+            hs_epoch = int(last_hs)
+            hs = int(time.time()) - hs_epoch if hs_epoch > 0 else 0
+            hs_str = ("never" if hs_epoch == 0
                       else f"{hs}s ago" if hs < 180
                       else f"{hs//60}min ago" if hs < 3600
                       else f"{hs//3600}h ago" if hs < 86400
@@ -472,6 +489,76 @@ def collect_tmux():
     return {"sessions": sessions, "count": len(sessions), "status": "ok"}
 
 
+def collect_fail2ban():
+    _, _, rc = run("sudo fail2ban-client ping", timeout=5)
+    if rc != 0:
+        return {"status": "unavailable", "jails": {}}
+    jails = {}
+    for jail in ["sshd", "nginx-http-auth", "caddy"]:
+        out, _, rc2 = run(f"sudo fail2ban-client status {jail}", timeout=10)
+        if rc2 != 0 or not out:
+            continue
+        m_banned = re.search(r'Currently banned:\s+(\d+)', out)
+        m_total  = re.search(r'Total banned:\s+(\d+)', out)
+        jails[jail] = {
+            "banned": int(m_banned.group(1)) if m_banned else 0,
+            "total_banned": int(m_total.group(1)) if m_total else 0,
+            "active": "Currently failed" in out,
+        }
+    return {"status": "active" if jails else "inactive", "jails": jails}
+
+
+def collect_ufw():
+    out, _, rc = run("sudo ufw status verbose", timeout=10)
+    enabled = rc == 0 and "Status: active" in out
+    log_out, _, _ = run("sudo tail -500 /var/log/ufw.log", timeout=5)
+    blocks = []
+    ip_counts = {}
+    for l in (log_out or "").splitlines():
+        if "BLOCK" not in l:
+            continue
+        m_src = re.search(r'SRC=(\S+)', l)
+        m_dst = re.search(r'DST=(\S+)', l)
+        m_dpt = re.search(r'DPT=(\S+)', l)
+        m_proto = re.search(r'PROTO=(\S+)', l)
+        m_in = re.search(r'IN=(\S+)', l)
+        ts = l.split(" ")[0] if l else ""
+        src = m_src.group(1) if m_src else "?"
+        entry = {
+            "time":  ts[:19],
+            "src":   src,
+            "dst":   m_dst.group(1) if m_dst else "?",
+            "port":  m_dpt.group(1) if m_dpt else "?",
+            "proto": m_proto.group(1) if m_proto else "?",
+            "iface": m_in.group(1) if m_in else "?",
+        }
+        blocks.append(entry)
+        ip_counts[src] = ip_counts.get(src, 0) + 1
+    top_ips = sorted(ip_counts.items(), key=lambda x: -x[1])[:10]
+    auth_out, _, _ = run("sudo tail -100 /var/log/auth.log", timeout=5)
+    auth_failures = [l for l in (auth_out or "").splitlines()
+                     if "Failed password" in l or "Invalid user" in l]
+    return {
+        "enabled": enabled,
+        "denies_hour": len(blocks),
+        "top_blocked_ips": [{"ip": ip, "count": c} for ip, c in top_ips],
+        "recent_blocks": blocks[-30:],
+        "auth_failures": auth_failures[-20:],
+    }
+
+
+def collect_ssh_sessions():
+    out, _, rc = run("w -h", timeout=5)
+    sessions = []
+    if rc == 0:
+        for line in out.splitlines():
+            p = line.split()
+            if len(p) >= 5 and p[1].startswith("pts"):
+                sessions.append({"user": p[0], "tty": p[1], "from": p[2],
+                                  "login_at": p[3], "idle": p[4]})
+    return {"sessions": sessions, "count": len(sessions)}
+
+
 def collect_claude_code():
     """Collect Claude Code CLI stats from ~/.claude/"""
     claude_home = Path.home() / ".claude"
@@ -536,6 +623,9 @@ def build_report():
     github_cli = collect_github_auth()
     tmux       = collect_tmux()
     claude_code = collect_claude_code()
+    fail2ban     = collect_fail2ban()
+    ufw          = collect_ufw()
+    ssh_sessions = collect_ssh_sessions()
 
     # OpenClaw checks : réutiliser le sidecar si < 1h (économise ~7s)
     cached_doc, cached_sec = _reuse_openclaw_from_sidecar()
@@ -566,6 +656,9 @@ def build_report():
         "github_cli":        github_cli,
         "tmux":              tmux,
         "claude_code":       claude_code,
+        "fail2ban":          fail2ban,
+        "ufw":               ufw,
+        "ssh_sessions":      ssh_sessions,
     }
 
 

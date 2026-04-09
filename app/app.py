@@ -3,14 +3,35 @@
 app.py — AI Cost Monitor. Cards compactes, période sélectionnable, health autonome.
 """
 
-import os, json, time, threading
+import os, json, time, threading, sqlite3
 from datetime import datetime, timedelta
 import streamlit as st
 import pandas as pd
+import plotly.graph_objects as go
+import psutil
 from collectors import collect_all
 from health_collector import collect_system, HEALTH_CACHE
 
 st.set_page_config(page_title="AI Monitor", page_icon="📊", layout="wide")
+
+METRICS_DB = "/data/metrics.db"
+
+def init_metrics_db():
+    conn = sqlite3.connect(METRICS_DB)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""CREATE TABLE IF NOT EXISTS metrics (
+        ts TEXT NOT NULL, cpu REAL, mem_pct REAL,
+        net_in REAL, net_out REAL, wg_peers INTEGER
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ts ON metrics(ts)")
+    conn.commit()
+    conn.close()
+
+try:
+    init_metrics_db()
+except Exception:
+    pass
+
 
 def _fmt_tokens(n):
     """Format token count: 1234 -> '1.2K', 123456 -> '123K', 1234567 -> '1.2M'."""
@@ -66,6 +87,80 @@ h1 { font-size: 1.3rem !important; margin-bottom: 0.1rem !important; }
 """, unsafe_allow_html=True)
 
 
+# ── Live metrics collector (10s → SQLite) ─────────────────────────────────────
+def live_collector():
+    _prev_net = None
+    while True:
+        try:
+            cpu = psutil.cpu_percent(interval=1)
+            mem = psutil.virtual_memory().percent
+            net = psutil.net_io_counters()
+            net_in = net_out = 0.0
+            if _prev_net:
+                net_in  = (net.bytes_recv - _prev_net.bytes_recv) / 1_048_576
+                net_out = (net.bytes_sent - _prev_net.bytes_sent) / 1_048_576
+            _prev_net = net
+            wg_peers = 0
+            try:
+                s = json.loads(open("/data/host-health.json").read())
+                wg_peers = s.get("wireguard", {}).get("connected_peers", 0)
+            except Exception:
+                pass
+            conn = sqlite3.connect(METRICS_DB)
+            conn.execute(
+                "INSERT INTO metrics VALUES (?,?,?,?,?,?)",
+                (datetime.utcnow().isoformat(), cpu, mem, net_in, net_out, wg_peers)
+            )
+            conn.execute("DELETE FROM metrics WHERE ts < datetime('now','-2 hours')")
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+        time.sleep(9)
+
+
+def collect_webmin():
+    url  = os.environ.get("WEBMIN_URL", "https://host.docker.internal:10000/xmlrpc.cgi")
+    user = os.environ.get("WEBMIN_USER", "")
+    pwd  = os.environ.get("WEBMIN_PASSWORD", "")
+    if not user or not pwd:
+        return {"status": "not_configured"}
+    try:
+        import xmlrpc.client, ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        transport = xmlrpc.client.SafeTransport(context=ctx)
+        proxy = xmlrpc.client.ServerProxy(
+            f"https://{user}:{pwd}@{url.split('://')[-1]}",
+            transport=transport
+        )
+        sys_status  = proxy.system.status_info()
+        services    = {s['name']: bool(s.get('running', 0))
+                       for s in (proxy.init.list_services() or [])}
+        apt_count   = len(proxy.package_updates.available_packages() or [])
+        recent_logs = proxy.webmin_log.get_recent_logs(3600)[-10:]
+        return {
+            "status": "ok",
+            "system_status": sys_status,
+            "services": services,
+            "apt_count": apt_count,
+            "recent_logs": recent_logs,
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+def _webmin_worker():
+    while True:
+        try:
+            result = collect_webmin()
+            st.session_state["webmin_live"] = result
+        except Exception:
+            pass
+        time.sleep(30)
+
+
 # ── Background health refresh (5 min) ─────────────────────────────────────────
 def _health_worker():
     while True:
@@ -85,22 +180,28 @@ if "health_thread_started" not in st.session_state:
         except Exception:
             pass
 
+if "live_collector_started" not in st.session_state:
+    threading.Thread(target=live_collector, daemon=True).start()
+    st.session_state["live_collector_started"] = True
+
+if "webmin_thread_started" not in st.session_state:
+    threading.Thread(target=_webmin_worker, daemon=True).start()
+    st.session_state["webmin_thread_started"] = True
+
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("**⚙️ Controls**")
     period = st.radio("Période", ["1j", "7j", "30j"], index=2, horizontal=True)
     period_days = {"1j": 1, "7j": 7, "30j": 30}[period]
+    refresh_interval = st.selectbox("Auto-refresh", [10, 30, 60],
+                                     format_func=lambda x: f"{x}s", index=1)
+    alerts_enabled = st.checkbox("🔔 Alertes CPU>80% / Disk<20%")
 
     if st.button("🔄 Refresh", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
-    auto = st.checkbox(
-        "Auto 5min (coûts IA)", value=False,
-        help="Recharge la page toutes les 5 min pour actualiser les coûts IA. "
-             "Les métriques système se rafraîchissent via un thread indépendant."
-    )
-    st.caption(f"UTC {datetime.utcnow().strftime('%H:%M')}")
+    st.caption(f"UTC {datetime.utcnow().strftime('%H:%M:%S')}")
 
 
 # ── Data ───────────────────────────────────────────────────────────────────────
@@ -129,6 +230,23 @@ if os.path.exists(HEALTH_CACHE):
             _health = json.load(f)
     except Exception:
         pass
+
+
+@st.cache_data(ttl=10)
+def load_metrics(n=60):
+    try:
+        conn = sqlite3.connect(METRICS_DB)
+        rows = conn.execute(
+            "SELECT ts,cpu,mem_pct,net_in,net_out,wg_peers FROM metrics ORDER BY ts DESC LIMIT ?", (n,)
+        ).fetchall()
+        conn.close()
+        if not rows:
+            return None
+        df = pd.DataFrame(rows, columns=["ts", "cpu", "mem_pct", "net_in", "net_out", "wg_peers"])
+        df["ts"] = pd.to_datetime(df["ts"], utc=True)
+        return df.sort_values("ts")
+    except Exception:
+        return None
 
 
 # ── Header ─────────────────────────────────────────────────────────────────────
@@ -495,6 +613,113 @@ with tabs[1]:
     else:
         st.caption("Collecte en cours…")
 
+    # ── ROW A — Graphs live ──────────────────────────────────────────────────
+    df_metrics = load_metrics(60)
+    if df_metrics is not None and len(df_metrics) > 2:
+        cg1, cg2, cg3 = st.columns(3)
+        GRAPH_LAYOUT = dict(height=180, margin=dict(l=20, r=10, t=30, b=20),
+                            paper_bgcolor="rgba(0,0,0,0)",
+                            plot_bgcolor="rgba(14,17,23,0.5)",
+                            font_color="#e2e8f0", showlegend=True)
+        with cg1:
+            fig = go.Figure(layout={**GRAPH_LAYOUT, "title": "CPU & RAM %"})
+            fig.add_trace(go.Scatter(x=df_metrics.ts, y=df_metrics.cpu, name="CPU", line=dict(color="#4CAF50")))
+            fig.add_trace(go.Scatter(x=df_metrics.ts, y=df_metrics.mem_pct, name="RAM", line=dict(color="#ff9800")))
+            fig.update_yaxes(range=[0, 100])
+            st.plotly_chart(fig, use_container_width=True)
+        with cg2:
+            fig2 = go.Figure(layout={**GRAPH_LAYOUT, "title": "Network MB (delta 10s)"})
+            fig2.add_trace(go.Scatter(x=df_metrics.ts, y=df_metrics.net_in, name="In", line=dict(color="#2196F3")))
+            fig2.add_trace(go.Scatter(x=df_metrics.ts, y=df_metrics.net_out, name="Out", line=dict(color="#f44336")))
+            st.plotly_chart(fig2, use_container_width=True)
+        with cg3:
+            fig3 = go.Figure(layout={**GRAPH_LAYOUT, "title": "WG Peers connectés"})
+            fig3.add_trace(go.Scatter(x=df_metrics.ts, y=df_metrics.wg_peers, name="Peers", fill="tozeroy", line=dict(color="#9c27b0")))
+            st.plotly_chart(fig3, use_container_width=True)
+    else:
+        st.info("Collecte en cours… graphs disponibles dans ~30s")
+
+    # ── ROW B — Docker Stats top 5 ──────────────────────────────────────────
+    docker_stats = _health.get("docker_stats", [])
+    if docker_stats:
+        df_stats = pd.DataFrame(docker_stats)
+        with st.expander("🐳 Docker Stats live — top 5 CPU", expanded=True):
+            st.dataframe(df_stats, use_container_width=True, hide_index=True)
+
+    # ── ROW C — Sécurité (Fail2ban | UFW/SSH) ───────────────────────────────
+    cs1, cs2 = st.columns(2)
+    with cs1:
+        st.markdown("#### 🛡️ Fail2ban")
+        fb = _health.get("fail2ban", {})
+        if fb.get("status") == "unavailable":
+            st.warning("Fail2ban non accessible (vérifier sudoers sur host)")
+        elif fb.get("status") == "inactive":
+            st.error("Fail2ban INACTIF")
+            st.warning("Sur le host : `sudo systemctl start fail2ban`")
+        elif fb.get("status") == "active":
+            st.success("Fail2ban actif")
+            for jail, info in fb.get("jails", {}).items():
+                banned = info.get("banned", 0)
+                color = "#fc8181" if banned > 0 else "#48bb78"
+                st.markdown(f'<span style="color:{color}">● {jail}: {banned} banni(s)</span>', unsafe_allow_html=True)
+        else:
+            st.caption("No data — run daily-health-check.py")
+    with cs2:
+        st.markdown("#### 🔥 UFW / SSH")
+        ufw = _health.get("ufw", {})
+        ssh_s = _health.get("ssh_sessions", {})
+        if ufw:
+            st.metric("UFW Denies/h", ufw.get("denies_hour", 0))
+            top_ips = ufw.get("top_blocked_ips", [])
+            recent = ufw.get("recent_blocks", [])
+            if top_ips or recent:
+                with st.expander(f"🔍 Détails blocks UFW ({ufw.get('denies_hour', 0)} bloqués)"):
+                    if top_ips:
+                        st.markdown("**Top IPs bloquées**")
+                        st.dataframe(
+                            pd.DataFrame(top_ips).rename(columns={"ip": "IP", "count": "Blocks"}),
+                            use_container_width=True, hide_index=True,
+                        )
+                    if recent:
+                        st.markdown("**Derniers blocks**")
+                        st.dataframe(
+                            pd.DataFrame(recent).rename(columns={
+                                "time": "Heure", "src": "Source", "dst": "Dest",
+                                "port": "Port", "proto": "Proto", "iface": "Interface",
+                            }),
+                            use_container_width=True, hide_index=True,
+                        )
+            auth_fails = ufw.get("auth_failures", [])
+            if auth_fails:
+                with st.expander(f"auth.log failures ({len(auth_fails)})"):
+                    st.code("\n".join(auth_fails), language=None)
+        sessions = ssh_s.get("sessions", [])
+        if sessions:
+            st.dataframe(pd.DataFrame(sessions), use_container_width=True, hide_index=True)
+        else:
+            st.caption("Aucune session SSH active")
+
+    # ── ROW D — Webmin Live ──────────────────────────────────────────────────
+    wm = st.session_state.get("webmin_live", {})
+    if wm.get("status") == "not_configured":
+        st.caption("Webmin : définir WEBMIN_USER + WEBMIN_PASSWORD dans .env pour activer")
+    elif wm.get("status") == "ok":
+        with st.expander("🖥️ Webmin Live", expanded=False):
+            wm_cols = st.columns(3)
+            sys_s = wm.get("system_status", {})
+            wm_cols[0].metric("Webmin CPU", f"{sys_s.get('cpu', '?')}%")
+            wm_cols[1].metric("Services UP", sum(1 for v in wm.get("services", {}).values() if v))
+            wm_cols[2].metric("APT Updates", wm.get("apt_count", "?"))
+            df_svc = pd.DataFrame([
+                {"Service": k, "Status": "🟢" if v else "🔴"}
+                for k, v in wm.get("services", {}).items()
+            ])
+            st.dataframe(df_svc, use_container_width=True, hide_index=True)
+            for log in wm.get("recent_logs", []):
+                st.caption(f"{log.get('time', '')} · {log.get('user', '')} → {log.get('module', '')}")
+    elif wm.get("status") == "error":
+        st.warning(f"Webmin: {wm.get('error', 'unreachable')}")
+
     if health:
         c1, c2 = st.columns(2)
         with c1:
@@ -778,6 +1003,8 @@ with tabs[1]:
 with tabs[2]:
     st.json(data)
 
-if auto:
-    time.sleep(300)
+if "initial_render_done" not in st.session_state:
+    st.session_state["initial_render_done"] = True
+else:
+    time.sleep(refresh_interval)
     st.rerun()

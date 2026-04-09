@@ -223,11 +223,15 @@ def collect_system():
     if isinstance(audit, list):  audit  = "\n".join(audit)
 
     # WireGuard, GitHub CLI, tmux, Claude Code, Network
-    wireguard   = sidecar.get("wireguard", {})
-    github_cli  = sidecar.get("github_cli", {})
-    tmux        = sidecar.get("tmux", {})
-    claude_code = sidecar.get("claude_code", {})
-    network     = sidecar.get("network", {})
+    wireguard    = sidecar.get("wireguard", {})
+    github_cli   = sidecar.get("github_cli", {})
+    tmux         = sidecar.get("tmux", {})
+    claude_code  = sidecar.get("claude_code", {})
+    network      = sidecar.get("network", {})
+    fail2ban     = sidecar.get("fail2ban", {})
+    ufw          = sidecar.get("ufw", {})
+    ssh_sessions = sidecar.get("ssh_sessions", {})
+    docker_stats = sidecar.get("docker", {}).get("docker_stats", [])
     disks       = sidecar.get("resources", {}).get("disks", [])
 
     # Métadonnées sidecar
@@ -263,6 +267,10 @@ def collect_system():
         "tmux":               tmux,
         "claude_code":        claude_code,
         "network":            network,
+        "fail2ban":           fail2ban,
+        "ufw":                ufw,
+        "ssh_sessions":       ssh_sessions,
+        "docker_stats":       docker_stats,
         "disks":              disks,
         "sidecar_at":         sidecar_at,
         "sidecar_stale":      _is_stale(sidecar_at),
