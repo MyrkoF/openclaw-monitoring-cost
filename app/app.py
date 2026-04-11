@@ -276,89 +276,49 @@ tabs = st.tabs(["💰 AI Costs", "🖥️ System Health", "🗂 Raw"])
 # ══════════════════════════════════════════════════════════════════
 with tabs[0]:
 
-    # ── Usage OpenClaw (gateway live) ─────────────────────────────
-    st.markdown("##### Usage OpenClaw (live)")
+    # ── Usage OpenClaw (gateway live) — coût par modèle ──────────
+    st.markdown("##### Usage OpenClaw (sessions live)")
     gw_live = st.session_state.get("openclaw_gw_live") or {}
-    gw_sessions = gw_live.get("sessions", {}).get("active", [])
+    gw_by_model = gw_live.get("sessions", {}).get("by_model", {})
+    gw_total = gw_live.get("sessions", {})
 
-    # Group sessions by provider from model name
-    def _provider_from_model(model):
-        if "/" in model:
-            prefix = model.split("/")[0]
-            if prefix in ("google",):
-                return "google"
-            # Everything routed via OpenRouter (moonshotai, deepseek, etc.)
-            return "openrouter"
-        if "gpt" in model or "o1" in model or "o3" in model or "o4" in model:
-            return "openai"
-        if "claude" in model:
-            return "anthropic"
-        if "gemini" in model:
-            return "google"
-        return "openrouter"
+    if gw_by_model:
+        # Sort models by cost descending
+        sorted_models = sorted(gw_by_model.items(), key=lambda x: x[1].get("cost_usd", 0), reverse=True)
+        total_cost = gw_total.get("total_cost_usd", 0)
+        total_tokens = gw_total.get("total_tokens", 0)
+        total_sessions = gw_total.get("count", 0)
 
-    prov_data = {}
-    for s in gw_sessions:
-        prov = _provider_from_model(s.get("model", ""))
-        prov_data.setdefault(prov, {"cost": 0, "tokens": 0, "count": 0})
-        prov_data[prov]["cost"] += s.get("cost_usd", 0)
-        prov_data[prov]["tokens"] += s.get("tokens", 0)
-        prov_data[prov]["count"] += 1
-
-    c1, c2, c3, c4 = st.columns(4)
-    prov_cards = [
-        (c1, "🔀", "OpenRouter", "openrouter"),
-        (c2, "🤖", "OpenAI",    "openai"),
-        (c3, "🧠", "Anthropic", "anthropic"),
-        (c4, "🌐", "Google",    "google"),
-    ]
-    for col, icon, label, key in prov_cards:
-        with col:
-            pd_ = prov_data.get(key)
-            if pd_ and pd_["count"]:
-                cost = pd_["cost"]
-                clr = "yellow" if cost > 1 else "green"
-                st.markdown(
-                    f'<div class="card">'
-                    f'<div class="card-header">{icon} {label}</div>'
-                    f'<div class="big-num {clr}">${cost:.4f}</div>'
-                    f'<div class="sub-num">{pd_["count"]} sessions · {pd_["tokens"]:,} tok</div>'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-            elif gw_sessions:
-                st.markdown(
-                    f'<div class="card">'
-                    f'<div class="card-header">{icon} {label}</div>'
-                    f'<div class="big-num grey">—</div>'
-                    f'<div class="sub-num grey">aucune session</div>'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-            else:
-                # Fallback to collector data if no gateway
-                pd_c = p.get(key, p.get(label.lower(), {}))
-                used = (pd_c.get("estimated_cost_usd") or pd_c.get("total_usage_usd_30d")
-                        or pd_c.get("total_usage_usd", 0) or 0)
-                rem  = pd_c.get("remaining_usd") or pd_c.get("credits_remaining_usd")
-                if rem is not None:
-                    st.markdown(
-                        f'<div class="card"><div class="card-header">{icon} {label}</div>'
-                        f'<div class="big-num green">${rem:.2f}</div><div class="sub-num">restant</div></div>',
-                        unsafe_allow_html=True,
-                    )
-                elif pd_c.get("status") == "ok":
-                    st.markdown(
-                        f'<div class="card"><div class="card-header">{icon} {label}</div>'
-                        f'<div class="big-num yellow">${used:.4f}</div><div class="sub-num">estimé ({period})</div></div>',
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    st.markdown(
-                        f'<div class="card"><div class="card-header">{icon} {label}</div>'
-                        f'<div class="big-num grey">—</div><div class="sub-num grey">pas de données</div></div>',
-                        unsafe_allow_html=True,
-                    )
+        model_rows = ""
+        for m, v in sorted_models:
+            cost = v.get("cost_usd", 0)
+            tokens = v.get("tokens", 0)
+            count = v.get("count", 0)
+            model_rows += (
+                f'<div class="model-row">'
+                f'<span style="max-width:45%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block">{m}</span>'
+                f'<span>'
+                f'<span class="badge">{count} sess</span>'
+                f'<span class="badge">{tokens:,} tok</span>'
+                f'<span class="badge badge-green">${cost:.4f}</span>'
+                f'</span></div>'
+            )
+        clr = "yellow" if total_cost > 1 else "green"
+        st.markdown(
+            f'<div class="card">'
+            f'<div class="card-header">🦞 OpenClaw Sessions'
+            f'<span class="badge badge-green" style="margin-left:auto;font-size:10px!important">LIVE</span></div>'
+            f'<div class="nums-row">'
+            f'<div class="info-block"><div class="big-num {clr}">${total_cost:.4f}</div><div class="sub-num">coût total</div></div>'
+            f'<div class="info-block"><div class="big-num">{total_sessions}</div><div class="sub-num">sessions</div></div>'
+            f'<div class="info-block"><div class="big-num grey">{total_tokens:,}</div><div class="sub-num">tokens</div></div>'
+            f'</div>'
+            f'{model_rows}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.caption("Gateway OpenClaw non disponible — données depuis les logs JSONL")
 
     st.markdown("<br>", unsafe_allow_html=True)
 
