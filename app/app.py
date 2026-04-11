@@ -154,6 +154,15 @@ def collect_webmin():
 # Global shared state (set by sidebar/init, read by workers — no st.session_state)
 _g = {"refresh": 60, "webmin": {}, "gw": {}}
 
+# One-time init: fetch gateway data before any render
+if not _g["gw"]:
+    try:
+        _init = _openclaw_gateway()
+        if _init:
+            _g["gw"] = _init
+    except Exception:
+        pass
+
 def _webmin_worker():
     while True:
         try:
@@ -202,13 +211,6 @@ if "webmin_thread_started" not in st.session_state:
     st.session_state["webmin_thread_started"] = True
 
 if "openclaw_gw_thread_started" not in st.session_state:
-    # Initial fetch before first render
-    try:
-        _init_gw = _openclaw_gateway()
-        if _init_gw is not None:
-            _g["gw"] = _init_gw
-    except Exception:
-        pass
     threading.Thread(target=_openclaw_gw_worker, daemon=True).start()
     st.session_state["openclaw_gw_thread_started"] = True
 
