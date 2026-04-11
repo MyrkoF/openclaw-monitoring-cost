@@ -1,5 +1,8 @@
 # AI Monitoring Dashboard
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support-orange?logo=buy-me-a-coffee)](https://buymeacoffee.com/myrko.f)
+
 Self-hosted Streamlit dashboard for tracking AI provider costs, usage per model, and VPS health. Runs in Docker with host networking, designed for personal VPS behind a VPN.
 
 <!-- Screenshot placeholder -->
