@@ -236,6 +236,7 @@ def _openclaw_gateway():
                 "status": s.get("status", "?"),
                 "updated": datetime.utcfromtimestamp(s["updatedAt"] / 1000).strftime("%H:%M:%S")
                            if s.get("updatedAt") else "?",
+                "updated_at_ms": s.get("updatedAt", 0),
             }
             for s in sessions
         ]

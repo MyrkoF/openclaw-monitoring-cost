@@ -169,17 +169,19 @@ def _openclaw_gw_worker():
                 st.session_state["openclaw_gw_live"] = result
         except Exception:
             pass
-        time.sleep(30)
+        interval = st.session_state.get("_backend_refresh", 60)
+        time.sleep(max(interval, 30))
 
 
-# ── Background health refresh (5 min) ─────────────────────────────────────────
+# ── Background health refresh ────────────────────────────────────────────────
 def _health_worker():
     while True:
         try:
             collect_system()
         except Exception:
             pass
-        time.sleep(300)
+        interval = st.session_state.get("_backend_refresh", 60)
+        time.sleep(max(interval, 30))
 
 if "health_thread_started" not in st.session_state:
     t = threading.Thread(target=_health_worker, daemon=True)
@@ -216,8 +218,11 @@ with st.sidebar:
     st.markdown("**⚙️ Controls**")
     period = st.radio("Période", ["1j", "7j", "30j"], index=2, horizontal=True)
     period_days = {"1j": 1, "7j": 7, "30j": 30}[period]
-    refresh_interval = st.selectbox("Auto-refresh", [10, 30, 60],
-                                     format_func=lambda x: f"{x}s", index=1)
+    _refresh_opts = [30, 60, 300, 1800, 3600, 43200]
+    _refresh_labels = {30: "30s", 60: "1min", 300: "5min", 1800: "30min", 3600: "1h", 43200: "12h"}
+    refresh_interval = st.selectbox("Auto-refresh", _refresh_opts,
+                                     format_func=lambda x: _refresh_labels[x], index=1)
+    st.session_state["_backend_refresh"] = refresh_interval
     alerts_enabled = st.checkbox("🔔 Alertes CPU>80% / Disk<20%")
 
     if st.button("🔄 Refresh", use_container_width=True):
@@ -284,17 +289,34 @@ tabs = st.tabs(["💰 AI Costs", "🖥️ System Health", "🗂 Raw"])
 with tabs[0]:
 
     # ── Usage OpenClaw (gateway live) — coût par modèle ──────────
-    st.markdown("##### Usage OpenClaw (sessions live)")
+    st.markdown(f"##### Usage OpenClaw ({period})")
     gw_live = st.session_state.get("openclaw_gw_live") or {}
-    gw_by_model = gw_live.get("sessions", {}).get("by_model", {})
-    gw_total = gw_live.get("sessions", {})
+    gw_all_sessions = gw_live.get("sessions", {}).get("active", [])
+
+    # Filter sessions by period
+    import time as _t
+    _cutoff_ms = int((_t.time() - period_days * 86400) * 1000)
+    gw_filtered = [s for s in gw_all_sessions if s.get("updated_at_ms", 0) >= _cutoff_ms]
+    # For real period filtering, recompute by_model from filtered active sessions
+    gw_by_model = {}
+    for s in gw_filtered:
+        m = s.get("model", "unknown")
+        gw_by_model.setdefault(m, {"tokens": 0, "cost_usd": 0, "count": 0, "provider": "?"})
+        gw_by_model[m]["tokens"] += s.get("tokens", 0)
+        gw_by_model[m]["cost_usd"] += s.get("cost_usd", 0)
+        gw_by_model[m]["count"] += 1
+    # Apply provider from gateway data
+    gw_prov = gw_live.get("sessions", {}).get("by_model", {})
+    for m in gw_by_model:
+        if m in gw_prov:
+            gw_by_model[m]["provider"] = gw_prov[m].get("provider", "?")
 
     if gw_by_model:
         # Sort models by cost descending
         sorted_models = sorted(gw_by_model.items(), key=lambda x: x[1].get("cost_usd", 0), reverse=True)
-        total_cost = gw_total.get("total_cost_usd", 0)
-        total_tokens = gw_total.get("total_tokens", 0)
-        total_sessions = gw_total.get("count", 0)
+        total_cost = sum(v["cost_usd"] for v in gw_by_model.values())
+        total_tokens = sum(v["tokens"] for v in gw_by_model.values())
+        total_sessions = sum(v["count"] for v in gw_by_model.values())
 
         _PROV_ICONS = {"openrouter": "🔀", "openai": "🤖", "anthropic": "🧠", "google": "🌐"}
         model_rows = ""
@@ -409,9 +431,13 @@ with tabs[0]:
                 daily = [x for x in daily if x["date"] >= cutoff]
             if daily:
                 usage_period = sum(x["cost_usd"] for x in daily)
-            else:
+            elif usage > 0:
                 usage_period = usage
-                oai_period_label = "30j"  # honest: no daily data, showing 30d total
+                oai_period_label = f"~{period}"  # API total, may not match period
+            else:
+                # No daily + no total → show nothing rather than misleading 0
+                usage_period = 0
+                oai_period_label = period
 
             badge_org = (
                 f'<span class="badge" style="margin-left:auto;color:#667eea">{org}</span>'
@@ -484,7 +510,7 @@ with tabs[0]:
     # ── Detail row 2 : Anthropic + Google ─────────────────────────
     col_ant, col_goo = st.columns(2)
 
-    # ── Anthropic (API réelle) + Claude Code (stats locales) ─────
+    # ── Anthropic (API billing + Claude Code — une seule card) ────
     with col_ant:
         d        = p.get("anthropic", {})
         b_status = d.get("billing_status", "unavailable")
@@ -493,14 +519,13 @@ with tabs[0]:
         b_used   = d.get("credits_used_usd")
         b_src    = d.get("billing_source", "none")
 
-        # Card Anthropic API — seulement si billing réel disponible
+        # Billing section
+        billing_html = ""
         if b_status == "ok" and b_rem is not None and b_tot:
             b_pct = min((b_used or 0) / b_tot * 100, 100) if b_tot else 0
             b_clr = "green" if b_rem > 5 else ("yellow" if b_rem > 1 else "red")
             src_label = "Console API" if b_src == "console_key" else "Claude CLI"
-            st.markdown(
-                f'<div class="card">'
-                f'<div class="card-header">🧠 Anthropic API</div>'
+            billing_html = (
                 f'<div class="nums-row">'
                 f'<div class="info-block"><div class="big-num {b_clr}">${b_rem:.2f}</div><div class="sub-num">crédits restants</div></div>'
                 f'<div class="info-block"><div class="big-num">${b_used:.2f}</div><div class="sub-num">utilisé</div></div>'
@@ -508,20 +533,14 @@ with tabs[0]:
                 f'</div>'
                 f'<div class="prog-bar-bg"><div class="prog-bar-fill" style="width:{b_pct:.1f}%"></div></div>'
                 f'<div class="sub-num grey">{b_pct:.2f}% consommé · {src_label}</div>'
-                f'</div>',
-                unsafe_allow_html=True,
             )
         else:
-            st.markdown(
-                f'<div class="card">'
-                f'<div class="card-header">🧠 Anthropic API</div>'
-                f'<div class="sub-num grey">Clé API requise (ANTHROPIC_API_KEY_MONITORING)</div>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
+            billing_html = '<div class="sub-num grey">Clé API requise (ANTHROPIC_API_KEY_MONITORING)</div>'
 
-        # Card Claude Code — stats locales depuis sidecar
+        # Claude Code section
         cc = _health.get("claude_code", {})
+        cc_html = ""
+        cc_badge = ""
         if cc.get("status") == "ok":
             sub_type = (cc.get("subscription_type") or "?").upper()
             tier     = cc.get("rate_limit_tier", "")
@@ -529,22 +548,21 @@ with tabs[0]:
             sessions = cc.get("total_sessions", 0)
             messages = cc.get("total_messages", 0)
             model_usage = cc.get("model_usage", {})
+            cc_badge = f' <span class="badge badge-green" style="margin-left:auto">{sub_type}</span>'
             cc_rows = ""
             for m, v in model_usage.items():
                 inp = v.get("inputTokens", 0) + v.get("cacheReadInputTokens", 0) + v.get("cacheCreationInputTokens", 0)
                 out = v.get("outputTokens", 0)
                 cc_rows += (
-                    f'<div class="model-row">'
-                    f'<span>{m}</span>'
-                    f'<span>'
+                    f'<div class="model-row"><span>{m}</span><span>'
                     f'<span class="badge">in {_fmt_tokens(inp)}</span>'
                     f'<span class="badge">out {_fmt_tokens(out)}</span>'
                     f'</span></div>'
                 )
             last_computed = cc.get("last_computed", "")
-            st.markdown(
-                f'<div class="card">'
-                f'<div class="card-header">🤖 Claude Code <span class="badge badge-green" style="margin-left:auto">{sub_type}</span></div>'
+            cc_html = (
+                f'<hr class="divider">'
+                f'<div class="sub-num grey" style="margin-bottom:4px">Claude Code</div>'
                 f'<div class="nums-row">'
                 f'<div class="info-block"><div class="big-num">{sessions}</div><div class="sub-num">sessions</div></div>'
                 f'<div class="info-block"><div class="big-num">{messages}</div><div class="sub-num">messages</div></div>'
@@ -552,9 +570,16 @@ with tabs[0]:
                 f'</div>'
                 f'{cc_rows}'
                 f'<div class="sub-num grey" style="margin-top:4px">Stats CLI locales · màj {last_computed}</div>'
-                f'</div>',
-                unsafe_allow_html=True,
             )
+
+        st.markdown(
+            f'<div class="card">'
+            f'<div class="card-header">🧠 Anthropic{cc_badge}</div>'
+            f'{billing_html}'
+            f'{cc_html}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
 
     # ── Google Gemini ───────────────────────────────────────────────
     with col_goo:
