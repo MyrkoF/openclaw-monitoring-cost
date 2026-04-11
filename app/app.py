@@ -220,11 +220,11 @@ with st.sidebar:
     st.markdown("**⚙️ Controls**")
     period = st.radio("Période", ["1j", "7j", "30j"], index=2, horizontal=True)
     period_days = {"1j": 1, "7j": 7, "30j": 30}[period]
-    _refresh_opts = [30, 60, 300, 1800, 3600, 43200]
-    _refresh_labels = {30: "30s", 60: "1min", 300: "5min", 1800: "30min", 3600: "1h", 43200: "12h"}
-    refresh_interval = st.selectbox("Auto-refresh", _refresh_opts,
-                                     format_func=lambda x: _refresh_labels[x], index=1)
-    _g["refresh"] = refresh_interval
+    _backend_opts = [30, 60, 300, 1800, 3600, 43200]
+    _backend_labels = {30: "30s", 60: "1min", 300: "5min", 1800: "30min", 3600: "1h", 43200: "12h"}
+    backend_interval = st.selectbox("Collecte backend", _backend_opts,
+                                     format_func=lambda x: _backend_labels[x], index=1)
+    _g["refresh"] = backend_interval
     alerts_enabled = st.checkbox("🔔 Alertes CPU>80% / Disk<20%")
 
     if st.button("🔄 Refresh", use_container_width=True):
@@ -1256,8 +1256,6 @@ with tabs[1]:
 with tabs[2]:
     st.json(data)
 
-# Auto-refresh via meta tag (no blocking sleep)
-st.markdown(
-    f'<meta http-equiv="refresh" content="{refresh_interval}">',
-    unsafe_allow_html=True,
-)
+# UI auto-refresh (10s) — just re-reads data already collected by backend workers
+from streamlit_autorefresh import st_autorefresh
+st_autorefresh(interval=10_000, key="auto_refresh")

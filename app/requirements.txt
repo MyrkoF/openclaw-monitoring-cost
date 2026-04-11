@@ -4,3 +4,4 @@ pandas==2.2.3
 cryptography==42.0.8
 plotly>=5.20.0
 psutil>=5.9.0
+streamlit-autorefresh>=1.0.1
