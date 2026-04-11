@@ -272,10 +272,18 @@ with tabs[0]:
                 used = (pd_.get("total_usage_usd_30d")
                         or pd_.get("total_usage_usd")
                         or pd_.get("estimated_cost_usd", 0) or 0)
+                # Fallback: si pas de solde et pas de coût API, montrer coût estimé par modèle
+                if not used and pd_.get("by_model"):
+                    used = round(sum(v.get("cost_usd", 0) for v in pd_["by_model"].values()), 4)
                 if rem is not None:
                     clr    = "green" if rem > 5 else ("yellow" if rem > 1 else "red")
                     label2 = "restant"
                     big    = f"${rem:.2f}"
+                elif pd_.get("prepaid_remaining_usd") is None and pd_.get("provider") == "openai":
+                    # OpenAI: pas d'accès au solde prépayé via API
+                    clr    = "grey"
+                    big    = "N/A"
+                    label2 = "solde non dispo via API"
                 else:
                     clr    = "yellow"
                     big    = f"${used:.4f}"
@@ -616,28 +624,24 @@ with tabs[1]:
     # ── ROW A — Graphs live ──────────────────────────────────────────────────
     df_metrics = load_metrics(60)
     if df_metrics is not None and len(df_metrics) > 2:
-        cg1, cg2, cg3 = st.columns(3)
+        cg1, cg2 = st.columns(2)
         GRAPH_LAYOUT = dict(height=180, margin=dict(l=20, r=10, t=30, b=20),
                             paper_bgcolor="rgba(0,0,0,0)",
                             plot_bgcolor="rgba(14,17,23,0.5)",
                             font_color="#e2e8f0", showlegend=True)
         with cg1:
             fig = go.Figure(layout={**GRAPH_LAYOUT, "title": "CPU & RAM %"})
-            fig.add_trace(go.Scatter(x=df_metrics.ts, y=df_metrics.cpu, name="CPU", line=dict(color="#4CAF50")))
-            fig.add_trace(go.Scatter(x=df_metrics.ts, y=df_metrics.mem_pct, name="RAM", line=dict(color="#ff9800")))
+            fig.add_trace(go.Scatter(x=df_metrics.ts, y=df_metrics.cpu, name="CPU", line=dict(color="#4CAF50", width=1.5)))
+            fig.add_trace(go.Scatter(x=df_metrics.ts, y=df_metrics.mem_pct, name="RAM", line=dict(color="#ff9800", width=1.5)))
             fig.update_yaxes(range=[0, 100])
             st.plotly_chart(fig, use_container_width=True)
         with cg2:
-            fig2 = go.Figure(layout={**GRAPH_LAYOUT, "title": "Network MB (delta 10s)"})
-            fig2.add_trace(go.Scatter(x=df_metrics.ts, y=df_metrics.net_in, name="In", line=dict(color="#2196F3")))
-            fig2.add_trace(go.Scatter(x=df_metrics.ts, y=df_metrics.net_out, name="Out", line=dict(color="#f44336")))
+            fig2 = go.Figure(layout={**GRAPH_LAYOUT, "title": "Network I/O (MB/10s)"})
+            fig2.add_trace(go.Scatter(x=df_metrics.ts, y=df_metrics.net_in, name="In", fill="tozeroy", line=dict(color="#2196F3", width=1)))
+            fig2.add_trace(go.Scatter(x=df_metrics.ts, y=df_metrics.net_out, name="Out", fill="tozeroy", line=dict(color="#f44336", width=1)))
             st.plotly_chart(fig2, use_container_width=True)
-        with cg3:
-            fig3 = go.Figure(layout={**GRAPH_LAYOUT, "title": "WG Peers connectés"})
-            fig3.add_trace(go.Scatter(x=df_metrics.ts, y=df_metrics.wg_peers, name="Peers", fill="tozeroy", line=dict(color="#9c27b0")))
-            st.plotly_chart(fig3, use_container_width=True)
     else:
-        st.info("Collecte en cours… graphs disponibles dans ~30s")
+        st.info("Collecte en cours... graphs disponibles dans ~30s")
 
     # ── ROW B — Docker Stats top 5 ──────────────────────────────────────────
     docker_stats = _health.get("docker_stats", [])
@@ -884,23 +888,36 @@ with tabs[1]:
             wt         = health.get("watchtower_updates", [])
             wt_errors  = health.get("watchtower_errors", [])
             wt_source  = health.get("watchtower_source", "logs")
-            wt_color   = "red" if wt_errors else ("yellow" if wt else "green")
+            wt_imgs    = health.get("wt_image_updates", [])
+            wt_color   = "red" if wt_errors else ("yellow" if wt_imgs else "green")
             src_badge  = (
                 '<span class="badge badge-green">API</span>'
                 if wt_source == "api"
                 else '<span class="badge">sidecar</span>'
             )
             err_badge  = (
-                f'<span class="badge" style="color:#fc8181">⚠️ {len(wt_errors)} erreur(s)</span>'
+                f'<span class="badge" style="color:#fc8181">{len(wt_errors)} erreur(s)</span>'
                 if wt_errors else ""
             )
+            # Image updates — show container + image name
+            import re as _re
+            img_rows = ""
+            for u in wt_imgs[-8:]:
+                ts = u.get("time", "")[-5:]  # HH:MM
+                ctr = u.get("container", "?")
+                img = u.get("image", "?")
+                img_rows += (
+                    f'<div class="model-row">'
+                    f'<span>{ctr}</span>'
+                    f'<span><span class="badge badge-blue">{img}</span>'
+                    f'<span class="badge">{ts}</span></span>'
+                    f'</div>'
+                )
+            # Session summaries
             wt_rows = ""
-            for x in wt[-5:]:
-                # Parse watchtower log: extract key info
-                import re as _re
+            for x in wt[-3:]:
                 m = _re.search(r'msg="([^"]+)"', x)
                 msg = m.group(1) if m else x[-60:]
-                # Extract counts
                 parts = []
                 for kv in _re.findall(r'(\w+)=(\d+)', x):
                     if kv[0] in ("scanned", "updated", "failed") and kv[1] != "0":
@@ -914,8 +931,10 @@ with tabs[1]:
             st.markdown(
                 f'<div class="card">'
                 f'<div class="card-header">🔄 Watchtower {src_badge}{err_badge}</div>'
-                f'<div class="big-num {wt_color}">{len(wt)}</div>'
+                f'<div class="big-num {wt_color}">{len(wt_imgs)}</div>'
                 f'<div class="sub-num">image(s) mise(s) à jour</div>'
+                f'{img_rows}'
+                f'<hr class="divider">'
                 f'{wt_rows}{err_rows}'
                 f'</div>',
                 unsafe_allow_html=True,
@@ -983,15 +1002,141 @@ with tabs[1]:
                     unsafe_allow_html=True,
                 )
 
-        # OpenClaw doctor / audit — depuis daily-health-check.py (sidecar JSON)
-        doctor = health.get("doctor", "")
-        audit  = health.get("security_audit", "")
-        if doctor and "daily-health-check" not in doctor:
-            with st.expander("🔒 OpenClaw Doctor"):
-                st.code(doctor, language=None)
-        if audit and "daily-health-check" not in audit:
-            with st.expander("🛡️ Security Audit"):
-                st.code(audit, language=None)
+        # ── OpenClaw card — structured doctor/security + version ────────────
+        oc_ver = health.get("openclaw_version", {})
+        doc_s  = health.get("doctor_structured", {})
+        sec_s  = health.get("security_structured", {})
+
+        if oc_ver or doc_s or sec_s:
+            st.markdown("#### 🦞 OpenClaw")
+            oc_cols = st.columns(2)
+
+            with oc_cols[0]:
+                # Version
+                installed = oc_ver.get("installed", "?")
+                latest    = oc_ver.get("latest", "?")
+                up2date   = oc_ver.get("up_to_date")
+                if up2date is True:
+                    ver_badge = f'<span class="badge badge-green">{installed}</span>'
+                elif up2date is False:
+                    ver_badge = f'<span class="badge" style="color:#fc8181">{installed} → {latest}</span>'
+                else:
+                    ver_badge = f'<span class="badge">{installed}</span>'
+
+                # Doctor
+                doc_status = doc_s.get("status", "?")
+                doc_icon = {"ok": "✅", "warn": "⚠️", "error": "❌"}.get(doc_status, "")
+                matrix = doc_s.get("matrix")
+                matrix_row = (
+                    f'<div class="model-row"><span>Matrix</span>'
+                    f'<span class="badge badge-green">{matrix["status"]} ({matrix["latency"]})</span></div>'
+                ) if matrix else ""
+                agents = doc_s.get("agents", [])
+                agents_row = (
+                    f'<div class="model-row"><span>Agents</span>'
+                    f'<span class="badge">{len(agents)}</span></div>'
+                ) if agents else ""
+                hb = doc_s.get("heartbeat")
+                hb_row = (
+                    f'<div class="model-row"><span>Heartbeat</span>'
+                    f'<span class="badge">{hb["interval"]} ({hb["agent"]})</span></div>'
+                ) if hb else ""
+                sess_count = doc_s.get("sessions_count")
+                sess_row = (
+                    f'<div class="model-row"><span>Sessions store</span>'
+                    f'<span class="badge">{sess_count} entries</span></div>'
+                ) if sess_count is not None else ""
+                mem_status = doc_s.get("memory_status")
+                mem_row = (
+                    f'<div class="model-row"><span>Memory plugin</span>'
+                    f'<span class="badge" style="color:#ecc94b">inactive</span></div>'
+                ) if mem_status == "inactive" else ""
+                # Plugin errors (only if > 0)
+                pe = doc_s.get("plugin_errors", 0)
+                pe_row = (
+                    f'<div class="model-row"><span>Plugin errors</span>'
+                    f'<span class="badge" style="color:#fc8181">{pe}</span></div>'
+                ) if pe else ""
+                # Skills blocked
+                sb = doc_s.get("skills_blocked", 0)
+                sb_row = (
+                    f'<div class="model-row"><span>Skills blocked</span>'
+                    f'<span class="badge" style="color:#fc8181">{sb}</span></div>'
+                ) if sb else ""
+                # Compat warnings
+                compat = doc_s.get("compat_warnings", [])
+                compat_rows = "".join(
+                    f'<div class="sub-num" style="color:#ecc94b;margin-top:2px">'
+                    f'⚠ {c["plugin"]}: legacy {c["hook"]}</div>'
+                    for c in compat
+                )
+
+                st.markdown(
+                    f'<div class="card">'
+                    f'<div class="card-header">🦞 OpenClaw {ver_badge} {doc_icon}</div>'
+                    f'{matrix_row}{agents_row}{hb_row}{sess_row}{mem_row}{pe_row}{sb_row}{compat_rows}'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+                # Session activity
+                activity = doc_s.get("session_activity", [])
+                if activity:
+                    with st.expander(f"Sessions récentes ({len(activity)})"):
+                        for a in activity:
+                            short_name = a["name"].replace("agent:main:", "")
+                            st.caption(f"  {short_name} — {a['ago']}")
+
+            with oc_cols[1]:
+                # Security summary
+                sec_status = sec_s.get("status", "?")
+                sec_icon = {"ok": "✅", "warn": "⚠️", "error": "❌"}.get(sec_status, "")
+                summary = sec_s.get("summary", {})
+                crit = summary.get("critical", 0)
+                warn = summary.get("warn", 0)
+                info = summary.get("info", 0)
+                crit_clr = "color:#fc8181" if crit else ""
+                warn_clr = "color:#ecc94b" if warn else ""
+
+                atk = sec_s.get("attack_surface", {})
+                trust_row = ""
+                if atk.get("trust_model"):
+                    short_trust = atk["trust_model"].split(",")[0][:40]
+                    trust_row = f'<div class="sub-num" style="margin-top:4px">🔒 {short_trust}</div>'
+
+                st.markdown(
+                    f'<div class="card">'
+                    f'<div class="card-header">🛡️ Security {sec_icon}</div>'
+                    f'<div class="nums-row">'
+                    f'<div class="info-block"><div class="big-num" style="{crit_clr}">{crit}</div><div class="sub-num">critical</div></div>'
+                    f'<div class="info-block"><div class="big-num" style="{warn_clr}">{warn}</div><div class="sub-num">warn</div></div>'
+                    f'<div class="info-block"><div class="big-num">{info}</div><div class="sub-num">info</div></div>'
+                    f'</div>'
+                    f'{trust_row}'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+                # Warnings detail
+                warnings = sec_s.get("warnings", [])
+                if warnings:
+                    with st.expander(f"Warnings ({len(warnings)})"):
+                        for w in warnings:
+                            msg = w.get("message", "")[:80]
+                            fix = w.get("fix", "")
+                            st.caption(f"⚠ {msg}")
+                            if fix:
+                                st.caption(f"  Fix: {fix[:80]}")
+
+            # Raw expanders for debug
+            doctor_raw = health.get("doctor", "")
+            audit_raw  = health.get("security_audit", "")
+            if doctor_raw and "daily-health-check" not in doctor_raw:
+                with st.expander("Détails bruts — Doctor"):
+                    st.code(doctor_raw, language=None)
+            if audit_raw and "daily-health-check" not in audit_raw:
+                with st.expander("Détails bruts — Security Audit"):
+                    st.code(audit_raw, language=None)
 
     else:
         st.info("Collecte système en cours, rafraîchis dans quelques secondes…")

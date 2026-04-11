@@ -18,6 +18,7 @@ services:
       - DB_PATH=${DB_PATH:-/data/monitoring.db}
       - OPENCLAW_LOGS_DIR=${OPENCLAW_LOGS_DIR:-/openclaw-logs}
       - OPENCLAW_SESSIONS_DIR=${OPENCLAW_SESSIONS_DIR:-/openclaw-sessions}
+      - OPENCLAW_CRON_DIR=${OPENCLAW_CRON_DIR:-/openclaw-cron}
       # Watchtower HTTP API (optionnel — fallback: sidecar host-health.json)
       - WATCHTOWER_API_URL=${WATCHTOWER_API_URL:-http://host.docker.internal:8080}
       - WATCHTOWER_API_TOKEN=${WATCHTOWER_API_TOKEN:-}
@@ -37,6 +38,8 @@ services:
       - ${HOME}/.openclaw/logs:/openclaw-logs:ro
       # Sessions OpenClaw (usage tokens) en lecture seule
       - ${HOME}/.openclaw/agents:/openclaw-sessions:ro
+      # Cron runs OpenClaw (Claude API usage) en lecture seule
+      - ${HOME}/.openclaw/cron/runs:/openclaw-cron:ro
       # Opt-in : billing Anthropic via token Claude Code CLI (sensible — décommenter si besoin)
       # - ${HOME}/.claude:/claude-home:ro
       # Opt-in : billing Google Cloud via service account JSON key

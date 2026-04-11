@@ -20,6 +20,7 @@ GOOGLE_API_KEY        = os.environ.get("GOOGLE_API_KEY", "")
 GOOGLE_SA_KEY_PATH    = os.environ.get("GOOGLE_SA_KEY_PATH", "/google-sa-key.json")
 OPENCLAW_LOGS_DIR     = os.environ.get("OPENCLAW_LOGS_DIR", "/openclaw-logs")
 OPENCLAW_SESSIONS_DIR = os.environ.get("OPENCLAW_SESSIONS_DIR", "/openclaw-sessions")
+OPENCLAW_CRON_DIR     = os.environ.get("OPENCLAW_CRON_DIR", "/openclaw-cron")
 
 # Pricing tables (USD / 1M tokens)
 ANTHROPIC_PRICING = {
@@ -79,6 +80,7 @@ def _parse_session_files(provider_filter_fn, days=30):
     patterns = [
         f"{OPENCLAW_SESSIONS_DIR}/**/*.jsonl",
         f"{OPENCLAW_LOGS_DIR}/**/*.jsonl",
+        f"{OPENCLAW_CRON_DIR}/**/*.jsonl",
     ]
     seen_files = set()
     for pattern in patterns:

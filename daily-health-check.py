@@ -215,18 +215,35 @@ def collect_docker():
 
 def collect_watchtower():
     try:
-        out, err, _ = run("docker logs --tail 50 watchtower 2>&1")
+        out, err, _ = run("docker logs --tail 200 watchtower 2>&1")
         combined = out or err
         raw_lines = [l for l in combined.splitlines() if l.strip()]
-        updates = [l for l in raw_lines if "updated" in l.lower()]
-        errors  = [l for l in raw_lines if "error" in l.lower()]
+        updates = [l for l in raw_lines if "Update session completed" in l]
+        errors  = [l for l in raw_lines if "error" in l.lower() and "Update session" not in l]
+
+        # Parse image updates: "Found new image" → container + image
+        image_updates = []
+        for line in raw_lines:
+            if "Found new image" not in line:
+                continue
+            ts_m = re.search(r'time="([^"]+)"', line)
+            ctr_m = re.search(r'container=(\S+)', line)
+            img_m = re.search(r'image="([^"]+)"', line)
+            if ctr_m and img_m:
+                image_updates.append({
+                    "time":      ts_m.group(1)[:16] if ts_m else "",
+                    "container": ctr_m.group(1),
+                    "image":     img_m.group(1),
+                })
+
         return {
-            "raw_last50": raw_lines,
-            "updates":    updates,
-            "errors":     errors,
+            "raw_last50":    raw_lines[-50:],
+            "updates":       updates,
+            "errors":        errors,
+            "image_updates": image_updates,
         }
     except Exception as e:
-        return {"raw_last50": [], "updates": [], "errors": [], "error": str(e)}
+        return {"raw_last50": [], "updates": [], "errors": [], "image_updates": [], "error": str(e)}
 
 
 def collect_apt():
@@ -283,6 +300,43 @@ def _filter_baseline(lines):
     ]
 
 
+def collect_openclaw_version():
+    """Version installée (npm) vs dernière release (blogwatcher)."""
+    installed = ""
+    out, _, rc = run("openclaw --version 2>/dev/null", timeout=10)
+    if rc == 0 and out:
+        # "OpenClaw 2026.4.9 (0512059)" → "2026.4.9"
+        m = re.search(r'(\d{4}\.\d+\.\d+)', out)
+        if m:
+            installed = m.group(1)
+
+    latest = ""
+    blogwatcher_bin = os.environ.get(
+        "BLOGWATCHER_BIN",
+        os.path.expanduser("~/go/bin/blogwatcher"),
+    )
+    blog_out, _, rc2 = run(
+        f'{blogwatcher_bin} articles -b "OpenClaw Releases" --all 2>/dev/null',
+        timeout=10,
+    )
+    if rc2 == 0 and blog_out:
+        for line in blog_out.splitlines():
+            # Skip beta/rc releases — find first stable version line
+            if "beta" in line.lower() or "-rc" in line.lower():
+                continue
+            m = re.search(r'(\d{4}\.\d+\.\d+)', line)
+            if m:
+                latest = m.group(1)
+                break
+
+    up_to_date = (installed == latest) if installed and latest else None
+    return {
+        "installed":  installed or "unknown",
+        "latest":     latest or "unknown",
+        "up_to_date": up_to_date,
+    }
+
+
 def collect_openclaw_doctor():
     out, err, code = run("openclaw doctor --yes 2>&1", timeout=60)
     combined = out or err
@@ -304,10 +358,55 @@ def collect_openclaw_doctor():
     else:
         status = "ok"
 
+    # ── Extraction structurée ──
+    raw_text = "\n".join(filtered)
+
+    # Matrix status + latence
+    matrix_m = re.search(r'Matrix:\s*(\w+)\s*\((\d+\w+)\)', raw_text)
+    matrix = {"status": matrix_m.group(1), "latency": matrix_m.group(2)} if matrix_m else None
+
+    # Agents listés
+    agents_m = re.search(r'Agents:\s*(.+)', raw_text)
+    agents = [a.strip() for a in agents_m.group(1).split(",")] if agents_m else []
+
+    # Heartbeat
+    heartbeat_m = re.search(r'Heartbeat interval:\s*(\S+)\s*\((\w+)\)', raw_text)
+    heartbeat = {"interval": heartbeat_m.group(1), "agent": heartbeat_m.group(2)} if heartbeat_m else None
+
+    # Sessions store
+    session_m = re.search(r'Session store.*?(\d+)\s*entr', raw_text)
+    sessions_count = int(session_m.group(1)) if session_m else None
+    # Recent session activity lines
+    session_activity = re.findall(r'-\s+(agent:\S+)\s+\((\S+\s+ago)\)', raw_text)
+
+    # Plugin errors
+    errors_m = re.search(r'Errors:\s*(\d+)', raw_text)
+    plugin_errors = int(errors_m.group(1)) if errors_m else 0
+
+    # Blocked by allowlist
+    blocked_m = re.search(r'Blocked by allowlist:\s*(\d+)', raw_text)
+    skills_blocked = int(blocked_m.group(1)) if blocked_m else 0
+
+    # Memory plugin
+    memory_m = re.search(r'No active memory plugin', raw_text)
+    memory_status = "inactive" if memory_m else "active"
+
+    # Plugin compat warnings
+    compat_warnings = re.findall(r'([\w-]+)\s+still uses legacy\s+(\w+)', raw_text)
+
     return {
-        "output":    filtered if filtered else ["✅ All clear"],
-        "exit_code": code,
-        "status":    status,
+        "output":          filtered if filtered else ["✅ All clear"],
+        "exit_code":       code,
+        "status":          status,
+        "matrix":          matrix,
+        "agents":          agents,
+        "heartbeat":       heartbeat,
+        "sessions_count":  sessions_count,
+        "session_activity": [{"name": a[0], "ago": a[1]} for a in session_activity[:5]],
+        "plugin_errors":   plugin_errors,
+        "skills_blocked":  skills_blocked,
+        "memory_status":   memory_status,
+        "compat_warnings": [{"plugin": c[0], "hook": c[1]} for c in compat_warnings],
     }
 
 
@@ -316,6 +415,50 @@ def collect_openclaw_security():
     combined = out or err
     lines = [l for l in combined.splitlines() if l.strip()]
     filtered = _filter_baseline(lines)
+
+    # ── Summary counts ──
+    summary_m = re.search(r'(\d+)\s*critical.*?(\d+)\s*warn.*?(\d+)\s*info', "\n".join(filtered))
+    summary = {
+        "critical": int(summary_m.group(1)) if summary_m else 0,
+        "warn":     int(summary_m.group(2)) if summary_m else 0,
+        "info":     int(summary_m.group(3)) if summary_m else 0,
+    }
+
+    # ── Extract structured warnings ──
+    warnings = []
+    current_warn = None
+    for line in filtered:
+        stripped = line.strip()
+        if not stripped or stripped in ("WARN", "INFO"):
+            continue
+        # Lines starting with a warning topic
+        if stripped.startswith("gateway.") or stripped.startswith("tools.") or stripped.startswith("summary."):
+            if current_warn:
+                warnings.append(current_warn)
+            current_warn = {"id": stripped.split()[0], "message": stripped, "fix": ""}
+        elif stripped.startswith("Fix:") and current_warn:
+            current_warn["fix"] = stripped[4:].strip()
+        elif stripped.startswith("Full exec trust") or stripped.startswith("Smaller/older") or \
+             stripped.startswith("Runtime/process") or stripped.startswith("Enabled extension") or \
+             stripped.startswith("Permissive tool") or stripped.startswith("Heuristic signals"):
+            if current_warn:
+                warnings.append(current_warn)
+            current_warn = {"id": "", "message": stripped, "fix": ""}
+        elif stripped.startswith("Fix:") and current_warn:
+            current_warn["fix"] = stripped[4:].strip()
+    if current_warn:
+        warnings.append(current_warn)
+
+    # ── Attack surface ──
+    attack_surface = {}
+    for line in filtered:
+        if "groups:" in line and "open=" in line:
+            am = re.search(r'open=(\d+).*allowlist=(\d+)', line)
+            if am:
+                attack_surface["groups_open"] = int(am.group(1))
+                attack_surface["groups_allowlist"] = int(am.group(2))
+        if "trust model:" in line:
+            attack_surface["trust_model"] = line.split("trust model:")[-1].strip()
 
     issues = [
         l for l in filtered
@@ -329,10 +472,13 @@ def collect_openclaw_security():
         status = "ok"
 
     return {
-        "output":    filtered if filtered else ["✅ All clear"],
-        "issues":    issues,
-        "exit_code": code,
-        "status":    status,
+        "output":         filtered if filtered else ["✅ All clear"],
+        "issues":         issues,
+        "exit_code":      code,
+        "status":         status,
+        "summary":        summary,
+        "warnings":       warnings,
+        "attack_surface": attack_surface,
     }
 
 
@@ -627,6 +773,8 @@ def build_report():
     ufw          = collect_ufw()
     ssh_sessions = collect_ssh_sessions()
 
+    openclaw_version = collect_openclaw_version()
+
     # OpenClaw checks : réutiliser le sidecar si < 1h (économise ~7s)
     cached_doc, cached_sec = _reuse_openclaw_from_sidecar()
     doctor   = cached_doc  or collect_openclaw_doctor()
@@ -649,6 +797,7 @@ def build_report():
         "docker":            docker,
         "watchtower":        watchtower,
         "apt":               apt,
+        "openclaw_version":  openclaw_version,
         "openclaw_doctor":   doctor,
         "openclaw_security": security,
         "services":          services,

@@ -213,14 +213,14 @@ def collect_system():
     # Services
     services = sidecar.get("services", {})
 
-    # OpenClaw doctor / security audit
+    # OpenClaw doctor / security audit — garder les données structurées
     doctor_section = sidecar.get("openclaw_doctor", {})
     audit_section  = sidecar.get("openclaw_security", {})
-    doctor  = doctor_section.get("output", sidecar.get("doctor", ""))
-    audit   = audit_section.get("output",  sidecar.get("security_audit", ""))
-    # Convertir liste → string si nécessaire pour l'affichage existant
-    if isinstance(doctor, list): doctor = "\n".join(doctor)
-    if isinstance(audit, list):  audit  = "\n".join(audit)
+    # Raw output pour expander debug
+    doctor_raw  = doctor_section.get("output", sidecar.get("doctor", ""))
+    audit_raw   = audit_section.get("output",  sidecar.get("security_audit", ""))
+    if isinstance(doctor_raw, list): doctor_raw = "\n".join(doctor_raw)
+    if isinstance(audit_raw, list):  audit_raw  = "\n".join(audit_raw)
 
     # WireGuard, GitHub CLI, tmux, Claude Code, Network
     wireguard    = sidecar.get("wireguard", {})
@@ -232,7 +232,9 @@ def collect_system():
     ufw          = sidecar.get("ufw", {})
     ssh_sessions = sidecar.get("ssh_sessions", {})
     docker_stats = sidecar.get("docker", {}).get("docker_stats", [])
-    disks       = sidecar.get("resources", {}).get("disks", [])
+    disks        = sidecar.get("resources", {}).get("disks", [])
+    openclaw_version = sidecar.get("openclaw_version", {})
+    wt_image_updates = sidecar.get("watchtower", {}).get("image_updates", [])
 
     # Métadonnées sidecar
     meta       = sidecar.get("meta", {})
@@ -260,8 +262,10 @@ def collect_system():
         "apt_timers":         apt_timers,
         "services":           services,
         "global_status":      global_status,
-        "doctor":             doctor or "Lancer daily-health-check.py sur le host",
-        "security_audit":     audit  or "Lancer daily-health-check.py sur le host",
+        "doctor":             doctor_raw or "Lancer daily-health-check.py sur le host",
+        "security_audit":     audit_raw  or "Lancer daily-health-check.py sur le host",
+        "doctor_structured":  doctor_section,
+        "security_structured": audit_section,
         "wireguard":          wireguard,
         "github_cli":         github_cli,
         "tmux":               tmux,
@@ -272,6 +276,8 @@ def collect_system():
         "ssh_sessions":       ssh_sessions,
         "docker_stats":       docker_stats,
         "disks":              disks,
+        "openclaw_version":   openclaw_version,
+        "wt_image_updates":   wt_image_updates,
         "sidecar_at":         sidecar_at,
         "sidecar_stale":      _is_stale(sidecar_at),
     }

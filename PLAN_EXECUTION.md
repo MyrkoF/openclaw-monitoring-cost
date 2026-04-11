@@ -65,12 +65,12 @@ DOCKER CONTAINER
 
 Ajouter 3 nouveaux blocs dans le sidecar et 2 nouvelles cards dans le dashboard :
 - **🔒 WireGuard** : interfaces wg0 + wg-mikrotik, peers connectés, handshakes, trafic
-- **🛠️ DevTools** : GitHub CLI auth (compte MyrkoF) + sessions tmux actives
+- **🛠️ DevTools** : GitHub CLI auth + sessions tmux actives
 
 ### Contexte VPS connu
 
 - WireGuard : 2 interfaces actives — `wg0` (3 peers) et `wg-mikrotik` (2 peers)
-- GitHub CLI : authentifié via `GITHUB_TOKEN`, compte `MyrkoF`
+- GitHub CLI : authentifié via `GITHUB_TOKEN`
 - tmux : 1 session `monitoring` active
 
 ---
@@ -383,7 +383,7 @@ docker compose up -d --build
     "total_peers": 5, "connected_peers": 5, "status": "ok"
   },
   "github_cli": {
-    "authenticated": true, "account": "MyrkoF",
+    "authenticated": true, "account": "<github_user>",
     "token_source": "GITHUB_TOKEN", "status": "ok"
   },
   "tmux": {

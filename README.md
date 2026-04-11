@@ -14,6 +14,8 @@ Tourne sur Docker, accessible uniquement via VPN (usage personnel).
 | **OpenClaw installé** (`openclaw`) | ✅ Obligatoire | Logs de sessions pour coûts Anthropic/Google |
 | **Dossier `~/.openclaw/logs`** | ✅ Obligatoire | Monté en lecture seule — logs d'usage |
 | **Dossier `~/.openclaw/agents`** | ✅ Obligatoire | Monté en lecture seule — sessions tokens |
+| **Dossier `~/.openclaw/cron/runs`** | ✅ Obligatoire | Monté en lecture seule — usage Claude API |
+| **blogwatcher** | Optionnel | Comparaison version OpenClaw installée vs dernière release |
 | **Claude Code CLI** (`~/.claude/`) | Optionnel | Billing Anthropic via token CLI — opt-in |
 | **Service account GCP** JSON key | Optionnel | Billing Google Cloud réel — opt-in |
 | **Token Watchtower HTTP API** | Optionnel | Métriques Watchtower via API (fallback : sidecar) |
@@ -25,9 +27,11 @@ Tourne sur Docker, accessible uniquement via VPN (usage personnel).
 | Fournisseur | Données | Méthode |
 |---|---|---|
 | **OpenRouter** | Crédits restants, usage total, coût par modèle | API `/credits` + logs OpenClaw |
-| **OpenAI** | Usage 30j, crédits prépayés, coût estimé par modèle | Admin API `/organization/costs` + `/usage/completions` |
+| **OpenAI** | Usage par modèle, coût estimé | Admin API `/organization/costs` + `/usage/completions` |
 | **Anthropic** | Coût estimé par modèle + crédits restants (optionnel) | Logs OpenClaw + Console API ou CLI token |
 | **Google Gemini** | Coût estimé par modèle + coût réel GCP (optionnel) | Logs OpenClaw + Cloud Billing API |
+
+> **Note OpenAI** : L'API OpenAI ne permet pas d'accéder au solde prépayé via clé API serveur (nécessite une session navigateur). Seul l'usage par modèle est affiché.
 
 ---
 
@@ -35,6 +39,8 @@ Tourne sur Docker, accessible uniquement via VPN (usage personnel).
 
 - **Python 3.12** + **Streamlit** — dashboard web
 - **httpx** — appels API REST
+- **plotly** — graphiques temps réel (CPU, RAM, Network)
+- **psutil** — métriques live dans le container
 - **cryptography** — signature JWT pour service account Google
 - **Docker + docker-compose** — déploiement
 
@@ -126,7 +132,7 @@ Si tu as des crédits prépayés Anthropic :
 
 ### 5. Configurer le cron job `daily-health-check.py`
 
-Ce script tourne sur le **host** (pas dans Docker) et alimente les sections **Docker**, **Watchtower**, **APT**, **OpenClaw Doctor**, **Security Audit** et **Services** du dashboard.
+Ce script tourne sur le **host** (pas dans Docker) et alimente les sections **Docker**, **Watchtower**, **APT**, **OpenClaw Doctor**, **Security Audit**, **WireGuard**, **Fail2ban**, **UFW** et **Services** du dashboard.
 
 ```bash
 # Tester manuellement (depuis le répertoire du projet)
@@ -172,6 +178,7 @@ Voir `.env.example` pour la liste complète.
 | `WATCHTOWER_API_URL` | Optionnel | URL API Watchtower (défaut : `http://host.docker.internal:8080`) |
 | `WATCHTOWER_API_TOKEN` | Optionnel | Token API Watchtower (vide = fallback sidecar) |
 | `GOOGLE_SA_KEY_PATH` | Optionnel | Chemin JSON service account GCP |
+| `BLOGWATCHER_BIN` | Optionnel | Chemin vers le binaire blogwatcher (défaut : `~/go/bin/blogwatcher`) |
 
 ---
 
@@ -182,6 +189,7 @@ Voir `.env.example` pour la liste complète.
 | `./data` | `/data` | SQLite + health cache + sidecar hôte |
 | `~/.openclaw/logs` | `/openclaw-logs` | Logs OpenClaw (lecture seule) |
 | `~/.openclaw/agents` | `/openclaw-sessions` | Sessions OpenClaw (lecture seule) |
+| `~/.openclaw/cron/runs` | `/openclaw-cron` | Cron runs OpenClaw — usage Claude API (lecture seule) |
 | `~/.claude` | `/claude-home` | Claude Code CLI config — **opt-in**, décommenter dans `docker-compose.yml` |
 | `~/google-sa-key.json` | `/google-sa-key.json` | Service account GCP — **opt-in**, décommenter dans `docker-compose.yml` |
 
@@ -207,17 +215,34 @@ Voir `.env.example` pour la liste complète.
 
 ## Features
 
+### AI Costs (Tab 1)
 - 📊 Cards par fournisseur avec crédits restants/consommés et usage
 - 💰 Coût USD par modèle sur OpenRouter, OpenAI, Anthropic, Google
 - 🏦 Double vue Anthropic : billing API (si configuré) + estimation logs
-- 🏦 OpenAI : crédits prépayés (si compte prépayé) ou mode postpayé
+- 🤖 Claude Code : stats locales (sessions, messages, tokens par modèle)
 - 📅 Sélecteur de période : 1j / 7j / 30j
-- 🖥️ System Health : uptime, CPU%, RAM, disque (via `/proc` — sans `procps`)
-- 🐳 Docker containers : liste + compteurs running / stopped / total
-- 🔄 Watchtower : mises à jour détectées + erreurs signalées
-- ⚙️ Services systemd : statuts en temps réel (ssh, ufw, fail2ban, nginx…)
-- 🌡️ Global status badge : ✅/⚠️/❌ agrégé depuis toutes les sections du sidecar
-- 🔒 OpenClaw Doctor + Security Audit (depuis `daily-health-check.py`)
-- 📦 APT : packages mis à jour + compteur upgradable
+
+### System Health (Tab 2)
+- 📈 Graphiques live : CPU & RAM %, Network I/O (10s refresh via SQLite)
+- 🖥️ Système : uptime, CPU%, RAM, disques multiples, réseau (via `/proc`)
+- 🐳 Docker : containers + stats live top 5 CPU
+- 🔄 Watchtower : sessions + **noms des images mises à jour**
+- 🛡️ Fail2ban : jails actives, IPs bannies
+- 🔥 UFW : blocks/heure, top IPs bloquées, détails blocks, auth failures
+- 🔒 WireGuard : interfaces, peers connectés, handshakes, trafic
+- ⚙️ Services systemd : statuts en temps réel
+- 🛠️ DevTools : GitHub CLI auth, tmux sessions
+- 📦 APT : packages mis à jour + compteur upgradable + timer auto-upgrade
+
+### OpenClaw (Tab 2)
+- 🦞 **Version** : installée vs dernière release (badge vert/rouge via blogwatcher)
+- 🩺 **Doctor structuré** : Matrix status, agents, heartbeat, sessions store, plugin errors, skills blocked, memory plugin
+- 🛡️ **Security structuré** : summary (critical/warn/info), warnings avec fix, attack surface
+- 📄 Expanders "Détails bruts" pour debug
+
+### Général
+- 🌡️ Global status badge : ✅/⚠️/❌ agrégé depuis toutes les sections
+- 🔄 Auto-refresh configurable (10s / 30s / 60s)
+- 🔔 Alertes CPU>80% / Disk<20% (opt-in)
 - 🔄 Cache persistant — données affichées même entre les refreshs
-- 🧵 Thread arrière-plan — métriques système rafraîchies toutes les 5 min
+- 🧵 Threads arrière-plan — métriques système (5 min), Webmin (30s), live collector (10s)
