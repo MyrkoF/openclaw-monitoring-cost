@@ -171,7 +171,7 @@ def _gw_invoke(url, token, ctx, tool_name, action="json"):
 
 def _openclaw_gateway():
     """Query OpenClaw gateway for live session/agent data. Returns dict or None."""
-    url   = os.environ.get("OPENCLAW_GATEWAY_URL", "https://host.docker.internal:18789")
+    url   = os.environ.get("OPENCLAW_GATEWAY_URL", "https://127.0.0.1:18789")
     token = os.environ.get("OPENCLAW_GATEWAY_TOKEN", "")
     if not token:
         return None

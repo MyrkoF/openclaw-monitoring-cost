@@ -5,8 +5,7 @@ services:
     build: .
     container_name: ai-monitoring
     restart: unless-stopped
-    ports:
-      - "8888:8888"
+    network_mode: host
     # Les clés sont injectées via start.sh depuis le keystore OpenClaw
     # Ne jamais mettre de clés en dur ici
     environment:
@@ -20,13 +19,13 @@ services:
       - OPENCLAW_SESSIONS_DIR=${OPENCLAW_SESSIONS_DIR:-/openclaw-sessions}
       - OPENCLAW_CRON_DIR=${OPENCLAW_CRON_DIR:-/openclaw-cron}
       # Watchtower HTTP API (optionnel — fallback: sidecar host-health.json)
-      - WATCHTOWER_API_URL=${WATCHTOWER_API_URL:-http://host.docker.internal:8080}
+      - WATCHTOWER_API_URL=${WATCHTOWER_API_URL:-http://127.0.0.1:8080}
       - WATCHTOWER_API_TOKEN=${WATCHTOWER_API_TOKEN:-}
       # OpenClaw Gateway API (optionnel — live sessions/agents)
-      - OPENCLAW_GATEWAY_URL=${OPENCLAW_GATEWAY_URL:-https://host.docker.internal:18789}
+      - OPENCLAW_GATEWAY_URL=${OPENCLAW_GATEWAY_URL:-https://127.0.0.1:18789}
       - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN:-}
       # Webmin (optionnel — monitoring host via XML-RPC)
-      - WEBMIN_URL=${WEBMIN_URL:-https://host.docker.internal:10000/xmlrpc.cgi}
+      - WEBMIN_URL=${WEBMIN_URL:-https://127.0.0.1:10000/xmlrpc.cgi}
       - WEBMIN_USER=${WEBMIN_USER:-}
       - WEBMIN_PASSWORD=${WEBMIN_PASSWORD:-}
       # Anthropic Console billing (optionnel)
@@ -47,8 +46,6 @@ services:
       # - ${HOME}/.claude:/claude-home:ro
       # Opt-in : billing Google Cloud via service account JSON key
       # - ${HOME}/google-sa-key.json:/google-sa-key.json:ro
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8888/_stcore/health"]
       interval: 30s

@@ -36,7 +36,7 @@ if [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]; then
   fi
 fi
 export OPENCLAW_GATEWAY_TOKEN
-export OPENCLAW_GATEWAY_URL="https://host.docker.internal:18789"
+export OPENCLAW_GATEWAY_URL="https://127.0.0.1:18789"
 
 echo "🔑 Clés monitoring chargées depuis OpenClaw :"
 echo "   OpenAI Mon    : ${OPENAI_API_KEY_MONITORING:0:20}..."
