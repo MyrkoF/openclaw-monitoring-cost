@@ -289,15 +289,20 @@ with tabs[0]:
         total_tokens = gw_total.get("total_tokens", 0)
         total_sessions = gw_total.get("count", 0)
 
+        _PROV_ICONS = {"openrouter": "🔀", "openai": "🤖", "anthropic": "🧠", "google": "🌐"}
         model_rows = ""
         for m, v in sorted_models:
             cost = v.get("cost_usd", 0)
             tokens = v.get("tokens", 0)
             count = v.get("count", 0)
+            prov = v.get("provider", "?")
+            prov_icon = _PROV_ICONS.get(prov, "")
+            prov_badge = f'<span class="badge" style="font-size:10px!important">{prov_icon} {prov}</span>' if prov != "?" else ""
             model_rows += (
                 f'<div class="model-row">'
-                f'<span style="max-width:45%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block">{m}</span>'
+                f'<span style="max-width:40%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block">{m}</span>'
                 f'<span>'
+                f'{prov_badge}'
                 f'<span class="badge">{count} sess</span>'
                 f'<span class="badge">{tokens:,} tok</span>'
                 f'<span class="badge badge-green">${cost:.4f}</span>'
