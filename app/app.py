@@ -276,68 +276,94 @@ tabs = st.tabs(["💰 AI Costs", "🖥️ System Health", "🗂 Raw"])
 # ══════════════════════════════════════════════════════════════════
 with tabs[0]:
 
-    # ── Summary cards row ──────────────────────────────────────────
-    c1, c2, c3, c4 = st.columns(4)
+    # ── Usage OpenClaw (gateway live) ─────────────────────────────
+    st.markdown("##### Usage OpenClaw (live)")
+    gw_live = st.session_state.get("openclaw_gw_live") or {}
+    gw_sessions = gw_live.get("sessions", {}).get("active", [])
 
-    def summary_card(col, icon, label, pd_):
-        s = pd_.get("status", "unknown")
+    # Group sessions by provider from model name
+    def _provider_from_model(model):
+        if "/" in model:
+            prefix = model.split("/")[0]
+            if prefix in ("google",):
+                return "google"
+            # Everything routed via OpenRouter (moonshotai, deepseek, etc.)
+            return "openrouter"
+        if "gpt" in model or "o1" in model or "o3" in model or "o4" in model:
+            return "openai"
+        if "claude" in model:
+            return "anthropic"
+        if "gemini" in model:
+            return "google"
+        return "openrouter"
+
+    prov_data = {}
+    for s in gw_sessions:
+        prov = _provider_from_model(s.get("model", ""))
+        prov_data.setdefault(prov, {"cost": 0, "tokens": 0, "count": 0})
+        prov_data[prov]["cost"] += s.get("cost_usd", 0)
+        prov_data[prov]["tokens"] += s.get("tokens", 0)
+        prov_data[prov]["count"] += 1
+
+    c1, c2, c3, c4 = st.columns(4)
+    prov_cards = [
+        (c1, "🔀", "OpenRouter", "openrouter"),
+        (c2, "🤖", "OpenAI",    "openai"),
+        (c3, "🧠", "Anthropic", "anthropic"),
+        (c4, "🌐", "Google",    "google"),
+    ]
+    for col, icon, label, key in prov_cards:
         with col:
-            if s == "ok":
-                rem  = pd_.get("remaining_usd") or pd_.get("credits_remaining_usd")
-                used = (pd_.get("total_usage_usd_30d")
-                        or pd_.get("total_usage_usd")
-                        or pd_.get("estimated_cost_usd", 0) or 0)
-                # Fallback: si pas de solde et pas de coût API, montrer coût estimé par modèle
-                if not used and pd_.get("by_model"):
-                    used = round(sum(v.get("cost_usd", 0) for v in pd_["by_model"].values()), 4)
-                if rem is not None:
-                    clr    = "green" if rem > 5 else ("yellow" if rem > 1 else "red")
-                    label2 = "restant"
-                    big    = f"${rem:.2f}"
-                elif pd_.get("prepaid_remaining_usd") is None and pd_.get("provider") == "openai":
-                    # OpenAI: pas d'accès au solde prépayé via API
-                    clr    = "grey"
-                    big    = "N/A"
-                    label2 = "solde non dispo via API"
-                else:
-                    clr    = "yellow"
-                    big    = f"${used:.4f}"
-                    label2 = f"utilisé ({period})"
+            pd_ = prov_data.get(key)
+            if pd_ and pd_["count"]:
+                cost = pd_["cost"]
+                clr = "yellow" if cost > 1 else "green"
                 st.markdown(
                     f'<div class="card">'
                     f'<div class="card-header">{icon} {label}</div>'
-                    f'<div class="big-num {clr}">{big}</div>'
-                    f'<div class="sub-num">{label2}</div>'
+                    f'<div class="big-num {clr}">${cost:.4f}</div>'
+                    f'<div class="sub-num">{pd_["count"]} sessions · {pd_["tokens"]:,} tok</div>'
                     f'</div>',
                     unsafe_allow_html=True,
                 )
-            elif s in ("no_logs", "no_key"):
-                msg = "clé manquante" if s == "no_key" else "aucun log"
+            elif gw_sessions:
                 st.markdown(
                     f'<div class="card">'
                     f'<div class="card-header">{icon} {label}</div>'
                     f'<div class="big-num grey">—</div>'
-                    f'<div class="sub-num grey">{msg}</div>'
+                    f'<div class="sub-num grey">aucune session</div>'
                     f'</div>',
                     unsafe_allow_html=True,
                 )
             else:
-                err = (pd_.get("error", "erreur"))[:40]
-                st.markdown(
-                    f'<div class="card">'
-                    f'<div class="card-header">{icon} {label}</div>'
-                    f'<div class="big-num red">❌</div>'
-                    f'<div class="sub-num red">{err}</div>'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-
-    summary_card(c1, "🔀", "OpenRouter", p.get("openrouter", {}))
-    summary_card(c2, "🤖", "OpenAI",    p.get("openai", {}))
-    summary_card(c3, "🧠", "Anthropic", p.get("anthropic", {}))
-    summary_card(c4, "🌐", "Google",    p.get("google", {}))
+                # Fallback to collector data if no gateway
+                pd_c = p.get(key, p.get(label.lower(), {}))
+                used = (pd_c.get("estimated_cost_usd") or pd_c.get("total_usage_usd_30d")
+                        or pd_c.get("total_usage_usd", 0) or 0)
+                rem  = pd_c.get("remaining_usd") or pd_c.get("credits_remaining_usd")
+                if rem is not None:
+                    st.markdown(
+                        f'<div class="card"><div class="card-header">{icon} {label}</div>'
+                        f'<div class="big-num green">${rem:.2f}</div><div class="sub-num">restant</div></div>',
+                        unsafe_allow_html=True,
+                    )
+                elif pd_c.get("status") == "ok":
+                    st.markdown(
+                        f'<div class="card"><div class="card-header">{icon} {label}</div>'
+                        f'<div class="big-num yellow">${used:.4f}</div><div class="sub-num">estimé ({period})</div></div>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        f'<div class="card"><div class="card-header">{icon} {label}</div>'
+                        f'<div class="big-num grey">—</div><div class="sub-num grey">pas de données</div></div>',
+                        unsafe_allow_html=True,
+                    )
 
     st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Comptes fournisseurs (APIs directes) ──────────────────────
+    st.markdown("##### Comptes fournisseurs")
 
     # ── Detail row 1 : OpenRouter + OpenAI ────────────────────────
     col_or, col_oai = st.columns(2)
@@ -405,10 +431,15 @@ with tabs[0]:
             pre_tot  = d.get("prepaid_total_usd")
             pre_used = d.get("prepaid_used_usd")
 
+            oai_period_label = period
             if period_days < 30 and daily:
                 cutoff = (datetime.utcnow() - timedelta(days=period_days)).strftime("%Y-%m-%d")
                 daily = [x for x in daily if x["date"] >= cutoff]
-            usage_period = sum(x["cost_usd"] for x in daily) if daily else usage
+            if daily:
+                usage_period = sum(x["cost_usd"] for x in daily)
+            else:
+                usage_period = usage
+                oai_period_label = "30j"  # honest: no daily data, showing 30d total
 
             badge_org = (
                 f'<span class="badge" style="margin-left:auto;color:#667eea">{org}</span>'
@@ -426,12 +457,12 @@ with tabs[0]:
                     f'<div class="info-block"><div class="big-num grey">${pre_tot:.2f}</div><div class="sub-num">total prépayé</div></div>'
                     f'</div>'
                     f'<div class="prog-bar-bg"><div class="prog-bar-fill" style="width:{pre_pct:.1f}%"></div></div>'
-                    f'<div class="sub-num grey">{pre_pct:.2f}% consommé · ${usage_period:.4f} utilisé ({period})</div>'
+                    f'<div class="sub-num grey">{pre_pct:.2f}% consommé · ${usage_period:.4f} utilisé ({oai_period_label})</div>'
                 )
             else:
                 credits_section = (
                     f'<div class="nums-row">'
-                    f'<div class="info-block"><div class="big-num yellow">${usage_period:.4f}</div><div class="sub-num">utilisé ({period})</div></div>'
+                    f'<div class="info-block"><div class="big-num yellow">${usage_period:.4f}</div><div class="sub-num">utilisé ({oai_period_label})</div></div>'
                     f'<div class="info-block"><div class="big-num grey">postpayé</div><div class="sub-num">pas de solde prépayé</div></div>'
                     f'</div>'
                 )
@@ -454,7 +485,7 @@ with tabs[0]:
                     f'</span></div>'
                 )
             model_section = (
-                f'<hr class="divider"><div class="sub-num grey" style="margin-bottom:5px">PAR MODÈLE (30j) — coût estimé</div>{model_rows}'
+                f'<hr class="divider"><div class="sub-num grey" style="margin-bottom:5px">PAR MODÈLE ({oai_period_label}) — coût estimé</div>{model_rows}'
                 if model_rows else '<div class="sub-num grey">Aucune donnée</div>'
             )
 
@@ -688,26 +719,37 @@ with tabs[1]:
         ufw = _health.get("ufw", {})
         ssh_s = _health.get("ssh_sessions", {})
         if ufw:
-            st.metric("UFW Denies/h", ufw.get("denies_hour", 0))
-            top_ips = ufw.get("top_blocked_ips", [])
-            recent = ufw.get("recent_blocks", [])
-            if top_ips or recent:
-                with st.expander(f"🔍 Détails blocks UFW ({ufw.get('denies_hour', 0)} bloqués)"):
-                    if top_ips:
-                        st.markdown("**Top IPs bloquées**")
-                        st.dataframe(
-                            pd.DataFrame(top_ips).rename(columns={"ip": "IP", "count": "Blocks"}),
-                            use_container_width=True, hide_index=True,
-                        )
-                    if recent:
-                        st.markdown("**Derniers blocks**")
-                        st.dataframe(
-                            pd.DataFrame(recent).rename(columns={
-                                "time": "Heure", "src": "Source", "dst": "Dest",
-                                "port": "Port", "proto": "Proto", "iface": "Interface",
-                            }),
-                            use_container_width=True, hide_index=True,
-                        )
+            # Filter out internal/container IPs (Docker, LAN, sandbox)
+            _INTERNAL_PREFIXES = ("172.", "10.", "192.168.", "127.")
+            def _is_external(ip):
+                return not any(ip.startswith(p) for p in _INTERNAL_PREFIXES)
+
+            all_top = ufw.get("top_blocked_ips", [])
+            all_recent = ufw.get("recent_blocks", [])
+            ext_top = [x for x in all_top if _is_external(x.get("ip", ""))][:5]
+            ext_recent = [x for x in all_recent if _is_external(x.get("src", ""))]
+            ext_denies = sum(x.get("count", 0) for x in ext_top)
+
+            st.metric("Attaques externes/h", ext_denies)
+
+            # Top 5 external IPs
+            if ext_top:
+                st.dataframe(
+                    pd.DataFrame(ext_top).rename(columns={"ip": "IP", "count": "Blocks"}),
+                    use_container_width=True, hide_index=True,
+                )
+
+            # Show more — full log in same section
+            if all_recent:
+                with st.expander(f"Log complet ({len(all_recent)} entries)"):
+                    st.dataframe(
+                        pd.DataFrame(all_recent).rename(columns={
+                            "time": "Heure", "src": "Source", "dst": "Dest",
+                            "port": "Port", "proto": "Proto", "iface": "Interface",
+                        }),
+                        use_container_width=True, hide_index=True,
+                    )
+
             auth_fails = ufw.get("auth_failures", [])
             if auth_fails:
                 with st.expander(f"auth.log failures ({len(auth_fails)})"):

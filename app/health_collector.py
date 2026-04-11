@@ -150,6 +150,31 @@ def _watchtower_api():
         return None
 
 
+# ── OpenClaw version check (GitHub Atom feed) ────────────────────────────────
+
+def _check_openclaw_latest():
+    """Fetch latest stable OpenClaw release from GitHub Atom feed."""
+    import urllib.request, xml.etree.ElementTree as ET
+    url = "https://github.com/openclaw/openclaw/releases.atom"
+    req = urllib.request.Request(url, headers={"User-Agent": "monitoring-dashboard/1.0"})
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        tree = ET.fromstring(resp.read().decode())
+    ns = {"atom": "http://www.w3.org/2005/Atom"}
+    for entry in tree.findall("atom:entry", ns):
+        tag_id = entry.find("atom:id", ns)
+        link = entry.find("atom:link", ns)
+        if tag_id is None:
+            continue
+        tag = tag_id.text.rsplit("/", 1)[-1]  # e.g. "v2026.4.10"
+        # Skip pre-release versions
+        if any(x in tag.lower() for x in ("beta", "alpha", "rc", "pre", "dev")):
+            continue
+        version = tag.lstrip("v")
+        release_url = link.get("href", "") if link is not None else ""
+        return {"latest": version, "url": release_url}
+    return None
+
+
 # ── OpenClaw Gateway API (live sessions/agents) ─────────────────────────────
 
 def _gw_invoke(url, token, ctx, tool_name, action="json"):
@@ -253,6 +278,14 @@ def _openclaw_gateway():
         result["session_status_text"] = status_text
     except Exception as e:
         result["errors"].append(f"session_status: {e}")
+
+    # ── version check (GitHub Atom feed) ──
+    try:
+        latest = _check_openclaw_latest()
+        if latest:
+            result["latest_stable"] = latest
+    except Exception:
+        pass
 
     # ── cron (job list + status) ──
     try:
@@ -379,6 +412,13 @@ def collect_system():
     # Prefer gateway version (live) over sidecar version (10min stale)
     if gw_data and gw_data.get("version"):
         openclaw_version = {**openclaw_version, "installed": gw_data["version"], "source": "gateway"}
+    # Latest stable from GitHub Atom feed
+    if gw_data and gw_data.get("latest_stable"):
+        ls = gw_data["latest_stable"]
+        openclaw_version["latest"] = ls["latest"]
+        openclaw_version["latest_url"] = ls["url"]
+        installed = openclaw_version.get("installed", "")
+        openclaw_version["up_to_date"] = (installed == ls["latest"])
     wt_image_updates = sidecar.get("watchtower", {}).get("image_updates", [])
 
     # Métadonnées sidecar
