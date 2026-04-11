@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-app.py — AI Cost Monitor. Cards compactes, période sélectionnable, health autonome.
+app.py — AI Cost Monitor. Compact cards, selectable period, autonomous health.
 """
 
 import os, json, time, threading, sqlite3
@@ -218,14 +218,14 @@ if "openclaw_gw_thread_started" not in st.session_state:
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("**⚙️ Controls**")
-    period = st.radio("Période", ["1j", "7j", "30j"], index=2, horizontal=True)
-    period_days = {"1j": 1, "7j": 7, "30j": 30}[period]
+    period = st.radio("Period", ["1d", "7d", "30d"], index=2, horizontal=True)
+    period_days = {"1d": 1, "7d": 7, "30d": 30}[period]
     _backend_opts = [30, 60, 300, 1800, 3600, 43200]
     _backend_labels = {30: "30s", 60: "1min", 300: "5min", 1800: "30min", 3600: "1h", 43200: "12h"}
-    backend_interval = st.selectbox("Collecte backend", _backend_opts,
+    backend_interval = st.selectbox("Backend interval", _backend_opts,
                                      format_func=lambda x: _backend_labels[x], index=1)
     _g["refresh"] = backend_interval
-    alerts_enabled = st.checkbox("🔔 Alertes CPU>80% / Disk<20%")
+    alerts_enabled = st.checkbox("🔔 Alerts CPU>80% / Disk<20%")
 
     if st.button("🔄 Refresh", use_container_width=True):
         st.cache_data.clear()
@@ -280,7 +280,7 @@ def load_metrics(n=60):
 
 # ── Header ─────────────────────────────────────────────────────────────────────
 st.markdown("# 📊 AI Cost Monitor")
-st.caption(f"VPS local · période : **{period}** · {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC")
+st.caption(f"Local VPS · period: **{period}** · {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC")
 
 tabs = st.tabs(["💰 AI Costs", "🖥️ System Health", "🗂 Raw"])
 
@@ -345,7 +345,7 @@ with tabs[0]:
             f'<div class="card-header">🦞 OpenClaw Sessions'
             f'<span class="badge badge-green" style="margin-left:auto;font-size:10px!important">LIVE</span></div>'
             f'<div class="nums-row">'
-            f'<div class="info-block"><div class="big-num {clr}">${total_cost:.4f}</div><div class="sub-num">coût total</div></div>'
+            f'<div class="info-block"><div class="big-num {clr}">${total_cost:.4f}</div><div class="sub-num">total cost</div></div>'
             f'<div class="info-block"><div class="big-num">{total_sessions}</div><div class="sub-num">sessions</div></div>'
             f'<div class="info-block"><div class="big-num grey">{total_tokens:,}</div><div class="sub-num">tokens</div></div>'
             f'</div>'
@@ -354,12 +354,12 @@ with tabs[0]:
             unsafe_allow_html=True,
         )
     else:
-        st.caption("Gateway OpenClaw non disponible — données depuis les logs JSONL")
+        st.caption("OpenClaw gateway unavailable — using JSONL logs")
 
     st.markdown("<br>", unsafe_allow_html=True)
 
     # ── Comptes fournisseurs (APIs directes) ──────────────────────
-    st.markdown("##### Comptes fournisseurs")
+    st.markdown("##### Provider Accounts")
 
     # ── Detail row 1 : OpenRouter + OpenAI ────────────────────────
     col_or, col_oai = st.columns(2)
@@ -388,7 +388,7 @@ with tabs[0]:
                     f'</span></div>'
                 )
             model_section = (
-                f'<hr class="divider"><div class="sub-num grey" style="margin-bottom:5px">PAR MODÈLE (via logs)</div>{model_rows}'
+                f'<hr class="divider"><div class="sub-num grey" style="margin-bottom:5px">BY MODEL (via logs)</div>{model_rows}'
                 if model_rows else ""
             )
 
@@ -397,11 +397,11 @@ with tabs[0]:
                 f'<div class="card-header">🔀 OpenRouter</div>'
                 f'<div class="nums-row">'
                 f'<div class="info-block"><div class="big-num {clr}">${rem:.4f}</div><div class="sub-num">restant</div></div>'
-                f'<div class="info-block"><div class="big-num">${used:.4f}</div><div class="sub-num">utilisé (total)</div></div>'
-                f'<div class="info-block"><div class="big-num grey">${total:.2f}</div><div class="sub-num">crédits total</div></div>'
+                f'<div class="info-block"><div class="big-num">${used:.4f}</div><div class="sub-num">used (total)</div></div>'
+                f'<div class="info-block"><div class="big-num grey">${total:.2f}</div><div class="sub-num">total credits</div></div>'
                 f'</div>'
                 f'<div class="prog-bar-bg"><div class="prog-bar-fill" style="width:{pct:.1f}%"></div></div>'
-                f'<div class="sub-num grey">{pct:.2f}% consommé</div>'
+                f'<div class="sub-num grey">{pct:.2f}% consumed</div>'
                 f'{model_section}'
                 f'</div>',
                 unsafe_allow_html=True,
@@ -452,18 +452,18 @@ with tabs[0]:
                 pre_clr = "green" if pre_rem > 5 else ("yellow" if pre_rem > 1 else "red")
                 credits_section = (
                     f'<div class="nums-row">'
-                    f'<div class="info-block"><div class="big-num {pre_clr}">${pre_rem:.4f}</div><div class="sub-num">crédits restants</div></div>'
-                    f'<div class="info-block"><div class="big-num">${pre_used:.4f}</div><div class="sub-num">utilisé (prépayé)</div></div>'
-                    f'<div class="info-block"><div class="big-num grey">${pre_tot:.2f}</div><div class="sub-num">total prépayé</div></div>'
+                    f'<div class="info-block"><div class="big-num {pre_clr}">${pre_rem:.4f}</div><div class="sub-num">remaining credits</div></div>'
+                    f'<div class="info-block"><div class="big-num">${pre_used:.4f}</div><div class="sub-num">used (prepaid)</div></div>'
+                    f'<div class="info-block"><div class="big-num grey">${pre_tot:.2f}</div><div class="sub-num">total prepaid</div></div>'
                     f'</div>'
                     f'<div class="prog-bar-bg"><div class="prog-bar-fill" style="width:{pre_pct:.1f}%"></div></div>'
-                    f'<div class="sub-num grey">{pre_pct:.2f}% consommé · ${usage_period:.4f} utilisé ({oai_period_label})</div>'
+                    f'<div class="sub-num grey">{pre_pct:.2f}% consumed · ${usage_period:.4f} used ({oai_period_label})</div>'
                 )
             else:
                 credits_section = (
                     f'<div class="nums-row">'
-                    f'<div class="info-block"><div class="big-num yellow">${usage_period:.4f}</div><div class="sub-num">utilisé ({oai_period_label})</div></div>'
-                    f'<div class="info-block"><div class="big-num grey">postpayé</div><div class="sub-num">pas de solde prépayé</div></div>'
+                    f'<div class="info-block"><div class="big-num yellow">${usage_period:.4f}</div><div class="sub-num">used ({oai_period_label})</div></div>'
+                    f'<div class="info-block"><div class="big-num grey">postpaid</div><div class="sub-num">no prepaid balance</div></div>'
                     f'</div>'
                 )
 
@@ -485,8 +485,8 @@ with tabs[0]:
                     f'</span></div>'
                 )
             model_section = (
-                f'<hr class="divider"><div class="sub-num grey" style="margin-bottom:5px">PAR MODÈLE ({oai_period_label}) — coût estimé</div>{model_rows}'
-                if model_rows else '<div class="sub-num grey">Aucune donnée</div>'
+                f'<hr class="divider"><div class="sub-num grey" style="margin-bottom:5px">BY MODEL ({oai_period_label}) — estimated cost</div>{model_rows}'
+                if model_rows else '<div class="sub-num grey">No data</div>'
             )
 
             st.markdown(
@@ -529,15 +529,15 @@ with tabs[0]:
             src_label = "Console API" if b_src == "console_key" else "Claude CLI"
             billing_html = (
                 f'<div class="nums-row">'
-                f'<div class="info-block"><div class="big-num {b_clr}">${b_rem:.2f}</div><div class="sub-num">crédits restants</div></div>'
-                f'<div class="info-block"><div class="big-num">${b_used:.2f}</div><div class="sub-num">utilisé</div></div>'
+                f'<div class="info-block"><div class="big-num {b_clr}">${b_rem:.2f}</div><div class="sub-num">remaining credits</div></div>'
+                f'<div class="info-block"><div class="big-num">${b_used:.2f}</div><div class="sub-num">used</div></div>'
                 f'<div class="info-block"><div class="big-num grey">${b_tot:.2f}</div><div class="sub-num">total</div></div>'
                 f'</div>'
                 f'<div class="prog-bar-bg"><div class="prog-bar-fill" style="width:{b_pct:.1f}%"></div></div>'
-                f'<div class="sub-num grey">{b_pct:.2f}% consommé · {src_label}</div>'
+                f'<div class="sub-num grey">{b_pct:.2f}% consumed · {src_label}</div>'
             )
         else:
-            billing_html = '<div class="sub-num grey">Clé API requise (ANTHROPIC_API_KEY_MONITORING)</div>'
+            billing_html = '<div class="sub-num grey">API key required (ANTHROPIC_API_KEY_MONITORING)</div>'
 
         # Claude Code section
         cc = _health.get("claude_code", {})
@@ -571,7 +571,7 @@ with tabs[0]:
                 f'<div class="info-block"><div class="big-num grey">{tier_short}</div><div class="sub-num">tier</div></div>'
                 f'</div>'
                 f'{cc_rows}'
-                f'<div class="sub-num grey" style="margin-top:4px">Stats CLI locales · màj {last_computed}</div>'
+                f'<div class="sub-num grey" style="margin-top:4px">Local CLI stats · updated {last_computed}</div>'
             )
 
         st.markdown(
@@ -601,7 +601,7 @@ with tabs[0]:
             )
             billing_section = (
                 f'<div class="nums-row">'
-                f'<div class="info-block"><div class="big-num yellow">${b_tot:.4f}</div><div class="sub-num">coût GCP réel (mois)</div></div>'
+                f'<div class="info-block"><div class="big-num yellow">${b_tot:.4f}</div><div class="sub-num">actual GCP cost (month)</div></div>'
                 f'</div>'
                 f'{"<hr class=\"divider\">" + gcp_rows if gcp_rows else ""}'
                 f'<hr class="divider">'
@@ -621,15 +621,15 @@ with tabs[0]:
         )
         cost_color = "yellow" if cost > 0 else "grey"
         if not model_rows and not by_m:
-            note = "Modèles Google passent via OpenRouter — comptabilisés dans OpenRouter"
+            note = "Google models routed via OpenRouter — costs included in OpenRouter"
         else:
-            note = "Estimation depuis logs OpenClaw · clé API simple"
+            note = "Estimated from OpenClaw logs · basic API key"
         if b_stat not in ("ok", "no_sa_key"):
             note += f" · GCP billing: {b_stat}"
 
         usage_section = (
             f'<div class="nums-row">'
-            f'<div class="info-block"><div class="big-num {cost_color}">${cost:.4f}</div><div class="sub-num">estimé ({period})</div></div>'
+            f'<div class="info-block"><div class="big-num {cost_color}">${cost:.4f}</div><div class="sub-num">estimated ({period})</div></div>'
             f'</div>'
         )
         model_divider = '<hr class="divider">' if model_rows else ""
@@ -659,9 +659,9 @@ with tabs[1]:
     gs          = health.get("global_status", "")
     gs_badge    = {"ok": "✅", "warn": "⚠️", "error": "❌"}.get(gs, "")
     if ts:
-        stale_note = f" · sidecar {'⚠️ expiré' if sidecar_stale else 'OK'} ({sidecar_ts})" if sidecar_ts else ""
+        stale_note = f" · sidecar {'⚠️ stale' if sidecar_stale else 'OK'} ({sidecar_ts})" if sidecar_ts else ""
         st.caption(
-            f"{gs_badge} Métriques système : {ts} UTC · thread 5 min{stale_note}"
+            f"{gs_badge} System metrics : {ts} UTC · 5min thread{stale_note}"
         )
     else:
         st.caption("Collecte en cours…")
@@ -701,16 +701,16 @@ with tabs[1]:
         st.markdown("#### 🛡️ Fail2ban")
         fb = _health.get("fail2ban", {})
         if fb.get("status") == "unavailable":
-            st.warning("Fail2ban non accessible (vérifier sudoers sur host)")
+            st.warning("Fail2ban not accessible (check sudoers on host)")
         elif fb.get("status") == "inactive":
-            st.error("Fail2ban INACTIF")
+            st.error("Fail2ban INACTIVE")
             st.warning("Sur le host : `sudo systemctl start fail2ban`")
         elif fb.get("status") == "active":
-            st.success("Fail2ban actif")
+            st.success("Fail2ban active")
             for jail, info in fb.get("jails", {}).items():
                 banned = info.get("banned", 0)
                 color = "#fc8181" if banned > 0 else "#48bb78"
-                st.markdown(f'<span style="color:{color}">● {jail}: {banned} banni(s)</span>', unsafe_allow_html=True)
+                st.markdown(f'<span style="color:{color}">● {jail}: {banned} banned</span>', unsafe_allow_html=True)
         else:
             st.caption("No data — run daily-health-check.py")
     with cs2:
@@ -729,7 +729,7 @@ with tabs[1]:
             ext_recent = [x for x in all_recent if _is_external(x.get("src", ""))]
             ext_denies = sum(x.get("count", 0) for x in ext_top)
 
-            st.metric("Attaques externes/h", ext_denies)
+            st.metric("External attacks/h", ext_denies)
 
             # Top 5 external IPs
             if ext_top:
@@ -740,10 +740,10 @@ with tabs[1]:
 
             # Show more — full log in same section
             if all_recent:
-                with st.expander(f"Log complet ({len(all_recent)} entries)"):
+                with st.expander(f"Full log ({len(all_recent)} entries)"):
                     st.dataframe(
                         pd.DataFrame(all_recent).rename(columns={
-                            "time": "Heure", "src": "Source", "dst": "Dest",
+                            "time": "Time", "src": "Source", "dst": "Dest",
                             "port": "Port", "proto": "Proto", "iface": "Interface",
                         }),
                         use_container_width=True, hide_index=True,
@@ -757,12 +757,12 @@ with tabs[1]:
         if sessions:
             st.dataframe(pd.DataFrame(sessions), use_container_width=True, hide_index=True)
         else:
-            st.caption("Aucune session SSH active")
+            st.caption("No active SSH sessions")
 
     # ── ROW D — Webmin Live ──────────────────────────────────────────────────
     wm = _g["webmin"]
     if wm.get("status") == "not_configured":
-        st.caption("Webmin : définir WEBMIN_USER + WEBMIN_PASSWORD dans .env pour activer")
+        st.caption("Webmin: set WEBMIN_USER + WEBMIN_PASSWORD in .env to enable")
     elif wm.get("status") == "ok":
         with st.expander("🖥️ Webmin Live", expanded=False):
             wm_cols = st.columns(3)
@@ -786,7 +786,7 @@ with tabs[1]:
             # Système card
             sys_rows = (
                 f'<div class="model-row"><span>Uptime</span><span><b>{health.get("uptime","N/A")}</b></span></div>'
-                f'<div class="model-row"><span>Depuis</span><span>{health.get("uptime_since","")}</span></div>'
+                f'<div class="model-row"><span>Since</span><span>{health.get("uptime_since","")}</span></div>'
                 f'<div class="model-row"><span>Load avg</span><span>{health.get("load","")}</span></div>'
                 f'<div class="model-row"><span>CPU cores</span><span>{health.get("cpu_cores","")}</span></div>'
                 f'<div class="model-row"><span>CPU %</span><span>{health.get("cpu_percent","")}</span></div>'
@@ -802,26 +802,26 @@ with tabs[1]:
                 if md.get("swap_total"):
                     sys_rows += f'<div class="model-row"><span>Swap</span><span>{md.get("swap_used","0")} / {md.get("swap_total","0")}</span></div>'
             else:
-                sys_rows += f'<div class="model-row"><span>Mémoire</span><span>{health.get("memory","")}</span></div>'
+                sys_rows += f'<div class="model-row"><span>Memory</span><span>{health.get("memory","")}</span></div>'
             disks = health.get("disks", [])
             if disks:
                 for dk in disks:
                     pct_num = int(dk["pct"].rstrip("%")) if dk.get("pct") else 0
                     dk_clr = "green" if pct_num < 70 else ("yellow" if pct_num < 90 else "red")
-                    sys_rows += f'<div class="model-row"><span>Disque {dk.get("mount","")}</span><span class="{dk_clr}">{dk.get("used","?")} / {dk.get("total","?")} ({dk.get("pct","?")})</span></div>'
+                    sys_rows += f'<div class="model-row"><span>Disk {dk.get("mount","")}</span><span class="{dk_clr}">{dk.get("used","?")} / {dk.get("total","?")} ({dk.get("pct","?")})</span></div>'
             else:
-                sys_rows += f'<div class="model-row"><span>Disque</span><span>{health.get("disk","")}</span></div>'
+                sys_rows += f'<div class="model-row"><span>Disk</span><span>{health.get("disk","")}</span></div>'
             # Network info
             net = health.get("network", {})
             if net:
                 pub_ip = net.get("public_ip", "")
                 if pub_ip:
-                    sys_rows += f'<div class="model-row"><span>IP publique</span><span>{pub_ip}</span></div>'
+                    sys_rows += f'<div class="model-row"><span>Public IP</span><span>{pub_ip}</span></div>'
                 for iface in net.get("interfaces", []):
                     if iface["type"] in ("lan", "vpn"):
                         sys_rows += f'<div class="model-row"><span>{iface["iface"]}</span><span class="badge {"badge-green" if iface["type"]=="vpn" else "badge"}">{iface["addr"]}</span></div>'
             st.markdown(
-                f'<div class="card"><div class="card-header">🖥️ Système</div>{sys_rows}</div>',
+                f'<div class="card"><div class="card-header">🖥️ System</div>{sys_rows}</div>',
                 unsafe_allow_html=True,
             )
 
@@ -852,19 +852,19 @@ with tabs[1]:
             # Timer info
             timer_row = ""
             if apt_timers.get("next_upgrade"):
-                timer_row = f'<div class="sub-num" style="margin-top:4px">⏱ Prochain upgrade auto : {apt_timers.get("left_upgrade", "")} ({apt_timers["next_upgrade"]})</div>'
+                timer_row = f'<div class="sub-num" style="margin-top:4px">⏱ Next auto upgrade: {apt_timers.get("left_upgrade", "")} ({apt_timers["next_upgrade"]})</div>'
             # Upgradable packages list
             upg_rows = ""
             for pkg in upgradable_list[:8]:
                 pkg_name = pkg.split("/")[0] if "/" in pkg else pkg
                 upg_rows += f'<div class="sub-num" style="margin-top:1px">• {pkg_name}</div>'
             if len(upgradable_list) > 8:
-                upg_rows += f'<div class="sub-num grey">… et {len(upgradable_list) - 8} autres</div>'
+                upg_rows += f'<div class="sub-num grey">… et {len(upgradable_list) - 8} more</div>'
             st.markdown(
                 f'<div class="card">'
                 f'<div class="card-header">📦 APT {upgradable_badge}</div>'
                 f'<div class="big-num {apt_clr}">{len(pkgs)}</div>'
-                f'<div class="sub-num">package(s) mis à jour récemment</div>'
+                f'<div class="sub-num">package(s) recently updated</div>'
                 f'{apt_rows}'
                 f'{"<hr class=\"divider\">" + upg_rows if upg_rows else ""}'
                 f'{timer_row}'
@@ -902,7 +902,7 @@ with tabs[1]:
                         )
                 st.markdown(
                     f'<div class="card">'
-                    f'<div class="card-header">🔒 WireGuard — {total_c}/{total_p} actifs</div>'
+                    f'<div class="card-header">🔒 WireGuard — {total_c}/{total_p} active</div>'
                     f'{iface_rows}'
                     f'</div>',
                     unsafe_allow_html=True,
@@ -935,7 +935,7 @@ with tabs[1]:
                 st.markdown(
                     '<div class="card">'
                     '<div class="card-header">🐳 Docker</div>'
-                    '<div class="sub-num grey">Lancer daily-health-check.py sur le host</div>'
+                    '<div class="sub-num grey">Run daily-health-check.py on the host</div>'
                     '</div>',
                     unsafe_allow_html=True,
                 )
@@ -952,7 +952,7 @@ with tabs[1]:
                 else '<span class="badge">sidecar</span>'
             )
             err_badge  = (
-                f'<span class="badge" style="color:#fc8181">{len(wt_errors)} erreur(s)</span>'
+                f'<span class="badge" style="color:#fc8181">{len(wt_errors)} error(s)</span>'
                 if wt_errors else ""
             )
             # Image updates — show container + image name
@@ -988,7 +988,7 @@ with tabs[1]:
                 f'<div class="card">'
                 f'<div class="card-header">🔄 Watchtower {src_badge}{err_badge}</div>'
                 f'<div class="big-num {wt_color}">{len(wt_imgs)}</div>'
-                f'<div class="sub-num">image(s) mise(s) à jour</div>'
+                f'<div class="sub-num">image(s) updated</div>'
                 f'{img_rows}'
                 f'<hr class="divider">'
                 f'{wt_rows}{err_rows}'
@@ -1024,7 +1024,7 @@ with tabs[1]:
                 dev_rows = ""
                 if gh:
                     gh_clr   = "badge-green" if gh.get("authenticated") else "badge"
-                    gh_label = gh.get("account") or "non authentifié"
+                    gh_label = gh.get("account") or "not authenticated"
                     gh_src   = f' · {gh["token_source"]}' if gh.get("token_source") else ""
                     dev_rows += (
                         f'<div class="model-row">'
@@ -1038,7 +1038,7 @@ with tabs[1]:
                         dev_rows += f'<div class="sub-num" style="margin-left:8px;margin-top:1px">↑ {repo} · {at}</div>'
                 if tmx:
                     sessions = tmx.get("sessions", [])
-                    tmx_label = f'{len(sessions)} session(s)' if sessions else "aucune"
+                    tmx_label = f'{len(sessions)} session(s)' if sessions else "none"
                     dev_rows += (
                         f'<div class="model-row">'
                         f'<span>tmux</span>'
@@ -1050,7 +1050,7 @@ with tabs[1]:
                         dur = f' · {s["duration"]}' if s.get("duration") else ""
                         dev_rows += (
                             f'<div class="sub-num" style="margin-top:2px">'
-                            f'• {s["name"]} · {s["windows"]} fenêtre(s){att}{dur}'
+                            f'• {s["name"]} · {s["windows"]} window(s){att}{dur}'
                             f'</div>'
                         )
                 st.markdown(
@@ -1190,7 +1190,7 @@ with tabs[1]:
                 # Session activity (sidecar doctor)
                 activity = doc_s.get("session_activity", [])
                 if activity:
-                    with st.expander(f"Sessions récentes ({len(activity)})"):
+                    with st.expander(f"Recent sessions ({len(activity)})"):
                         for a in activity:
                             short_name = a["name"].replace("agent:main:", "")
                             st.caption(f"  {short_name} — {a['ago']}")
@@ -1240,14 +1240,14 @@ with tabs[1]:
             doctor_raw = health.get("doctor", "")
             audit_raw  = health.get("security_audit", "")
             if doctor_raw and "daily-health-check" not in doctor_raw:
-                with st.expander("Détails bruts — Doctor"):
+                with st.expander("Raw output — Doctor"):
                     st.code(doctor_raw, language=None)
             if audit_raw and "daily-health-check" not in audit_raw:
-                with st.expander("Détails bruts — Security Audit"):
+                with st.expander("Raw output — Security Audit"):
                     st.code(audit_raw, language=None)
 
     else:
-        st.info("Collecte système en cours, rafraîchis dans quelques secondes…")
+        st.info("System collection in progress, refreshing shortly…")
 
 
 # ══════════════════════════════════════════════════════════════════

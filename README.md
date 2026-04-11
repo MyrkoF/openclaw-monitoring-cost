@@ -1,248 +1,206 @@
-# openclaw-monitoring-cost
+# AI Monitoring Dashboard
 
-Dashboard local de monitoring des coûts et usage des fournisseurs AI + santé du VPS.  
-Tourne sur Docker, accessible uniquement via VPN (usage personnel).
+Self-hosted Streamlit dashboard for tracking AI provider costs, usage per model, and VPS health. Runs in Docker with host networking, designed for personal VPS behind a VPN.
 
----
+<!-- Screenshot placeholder -->
 
-## Prérequis sur le VPS host
+## Features
 
-| Prérequis | Requis | Usage |
+### AI Costs tab
+
+- **OpenRouter** -- remaining credits, total spend, cost per model
+- **OpenAI** -- usage per model via Admin API (`/organization/costs`)
+- **Anthropic (merged card)** -- API billing (prepaid credits) + Claude Code local stats (sessions, messages, tokens) in a single card
+- **Google Gemini** -- estimated cost from logs, optional real GCP billing via service account
+- **OpenClaw Gateway** -- live session/agent/cron data from the gateway API (port 18789), real-time cost per model with provider badges
+- **Provider mapping** -- shows which provider routes each model (derived from live API data, not config files)
+- **Period selector** -- 1d / 7d / 30d filtering across all cards
+
+### System Health tab
+
+- **Live charts** -- CPU, RAM, Network I/O with 10s auto-refresh (SQLite-backed)
+- **System** -- uptime, CPU/RAM %, multiple disks, network stats (via `/proc`)
+- **Docker** -- running containers, top-5 CPU stats
+- **Watchtower** -- update sessions with image names
+- **Fail2ban** -- active jails, banned IPs
+- **UFW** -- blocks/hour, top blocked IPs, filtered to external attacks only (hides Docker/internal IPs), "Full log" expander for complete data
+- **WireGuard** -- interfaces, connected peers, handshakes, traffic
+- **Services** -- systemd unit status
+- **DevTools** -- GitHub CLI auth, tmux sessions
+- **APT** -- recent upgrades, upgradable count, auto-upgrade timer
+
+### OpenClaw card (System Health tab)
+
+- **Version check** -- installed vs latest stable release detected via GitHub Atom feed; red badge when update available (skips beta/alpha/rc)
+- **Doctor (structured)** -- Matrix status, agents, heartbeat, sessions store, plugin errors, skills blocked, memory plugin
+- **Security (structured)** -- summary (critical/warn/info), warnings with suggested fix, attack surface
+- Raw detail expanders for debugging
+
+### General
+
+- Global status badge aggregated from all sections
+- UI auto-refresh every 10s via `streamlit-autorefresh` (no full page reload)
+- Backend collect interval configurable from 30s to 12h (controls worker thread frequency)
+- Persistent cache -- data displayed even between refreshes
+- Background threads -- system metrics (5 min), Webmin (30s), live collector (10s)
+
+## Quick Start
+
+```bash
+# 1. Clone
+git clone <repo-url>
+cd monitoring
+
+# 2a. With OpenClaw installed (recommended) -- keys injected automatically
+./start.sh
+
+# 2b. Without OpenClaw -- manual .env
+cp .env.example .env
+# Edit .env with your API keys
+docker compose up -d --build
+
+# 3. Set up host sidecar (see Host Sidecar Setup below)
+
+# 4. Open dashboard
+# http://localhost:8888
+```
+
+## Configuration
+
+### Environment variables
+
+| Variable | Required | Description |
 |---|---|---|
-| **Docker + docker-compose** | ✅ Obligatoire | Lancer le container |
-| **Python 3** | ✅ Obligatoire | Lancer `daily-health-check.py` sur le host |
-| **OpenClaw installé** (`openclaw`) | ✅ Obligatoire | Logs de sessions pour coûts Anthropic/Google |
-| **Dossier `~/.openclaw/logs`** | ✅ Obligatoire | Monté en lecture seule — logs d'usage |
-| **Dossier `~/.openclaw/agents`** | ✅ Obligatoire | Monté en lecture seule — sessions tokens |
-| **Dossier `~/.openclaw/cron/runs`** | ✅ Obligatoire | Monté en lecture seule — usage Claude API |
-| **blogwatcher** | Optionnel | Comparaison version OpenClaw installée vs dernière release |
-| **Claude Code CLI** (`~/.claude/`) | Optionnel | Billing Anthropic via token CLI — opt-in |
-| **Service account GCP** JSON key | Optionnel | Billing Google Cloud réel — opt-in |
-| **Token Watchtower HTTP API** | Optionnel | Métriques Watchtower via API (fallback : sidecar) |
+| `OPENAI_API_KEY_MONITORING` | Yes | OpenAI admin key (scope `api.usage.read`) |
+| `OPENROUTER_API_KEY_MONITORING` | Yes | OpenRouter API key |
+| `ANTHROPIC_API_KEY_MONITORING` | Yes | Anthropic API key |
+| `GOOGLE_API_KEY` | No | Gemini API key (direct usage, not via OpenRouter) |
+| `ANTHROPIC_CONSOLE_API_KEY` | No | Anthropic Console key for prepaid credit balance |
+| `OPENCLAW_GATEWAY_URL` | No | OpenClaw gateway endpoint (default `https://127.0.0.1:18789`) |
+| `OPENCLAW_GATEWAY_TOKEN` | No | Auth token for the OpenClaw gateway API |
+| `WATCHTOWER_API_URL` | No | Watchtower HTTP API URL (default `http://127.0.0.1:8080`) |
+| `WATCHTOWER_API_TOKEN` | No | Watchtower API token (empty = fallback to sidecar) |
+| `WEBMIN_URL` | No | Webmin XML-RPC endpoint |
+| `WEBMIN_USER` / `WEBMIN_PASSWORD` | No | Webmin credentials |
+| `GOOGLE_SA_KEY_PATH` | No | Path to GCP service account JSON inside container |
 
----
+### Volumes
 
-## Fournisseurs supportés
-
-| Fournisseur | Données | Méthode |
+| Host path | Container path | Purpose |
 |---|---|---|
-| **OpenRouter** | Crédits restants, usage total, coût par modèle | API `/credits` + logs OpenClaw |
-| **OpenAI** | Usage par modèle, coût estimé | Admin API `/organization/costs` + `/usage/completions` |
-| **Anthropic** | Coût estimé par modèle + crédits restants (optionnel) | Logs OpenClaw + Console API ou CLI token |
-| **Google Gemini** | Coût estimé par modèle + coût réel GCP (optionnel) | Logs OpenClaw + Cloud Billing API |
+| `./data` | `/data` | SQLite DB, health cache, sidecar JSON |
+| `~/.openclaw/logs` | `/openclaw-logs` | OpenClaw logs (read-only) |
+| `~/.openclaw/agents` | `/openclaw-sessions` | OpenClaw agent sessions (read-only) |
+| `~/.openclaw/cron/runs` | `/openclaw-cron` | OpenClaw cron runs (read-only) |
+| `~/.claude` | `/claude-home` | Claude Code CLI config -- **opt-in**, uncomment in `docker-compose.yml` |
+| `~/google-sa-key.json` | `/google-sa-key.json` | GCP service account -- **opt-in**, uncomment in `docker-compose.yml` |
 
-> **Note OpenAI** : L'API OpenAI ne permet pas d'accéder au solde prépayé via clé API serveur (nécessite une session navigateur). Seul l'usage par modèle est affiché.
+### Host networking
 
----
-
-## Stack
-
-- **Python 3.12** + **Streamlit** — dashboard web
-- **httpx** — appels API REST
-- **plotly** — graphiques temps réel (CPU, RAM, Network)
-- **psutil** — métriques live dans le container
-- **cryptography** — signature JWT pour service account Google
-- **Docker + docker-compose** — déploiement
-
----
+The container runs with `network_mode: host`. No port mapping is needed -- the dashboard listens on port 8888 directly on the host. This also gives the container access to `127.0.0.1` services (Watchtower, OpenClaw Gateway, Webmin) without `host.docker.internal` workarounds.
 
 ## Architecture
 
 ```
-HOST (cron */10 min)
-  └─ daily-health-check.py
-       └─ écrit → ./data/host-health.json
+HOST (cron every 10 min)
+  daily-health-check.py
+    writes --> ./data/host-health.json
+      (Docker, Watchtower, APT, OpenClaw doctor/security,
+       UFW, Fail2ban, WireGuard, Services, DevTools)
 
-DOCKER CONTAINER
-  └─ app/health_collector.py
-       └─ lit ← /data/host-health.json  (volume partagé ./data:/data)
-       └─ lit ← /proc/*                 (métriques CPU/RAM/disque natives)
-       └─ appelle API providers         (OpenRouter, OpenAI, Anthropic, Google)
+DOCKER CONTAINER (network_mode: host)
+  app.py (Streamlit on :8888)
+    reads  <-- /data/host-health.json    (shared volume ./data:/data)
+    reads  <-- /proc/*                   (live CPU/RAM/disk/network)
+    reads  <-- /openclaw-logs, sessions, cron   (OpenClaw usage data)
+    calls  --> OpenRouter API            (credits, usage)
+    calls  --> OpenAI Admin API          (cost per model)
+    calls  --> Anthropic API             (billing, optional console)
+    calls  --> Google Cloud Billing API  (optional, via service account)
+    calls  --> OpenClaw Gateway :18789   (live sessions/agents/cron)
+    calls  --> Watchtower :8080          (optional, image updates)
+    stores --> /data/monitoring.db       (SQLite -- time-series cache)
 ```
 
-Le container n'a **pas** accès au Docker socket — toutes les données host passent par le fichier sidecar JSON.
+The container does **not** mount the Docker socket. All host-level data flows through the sidecar JSON file.
 
----
+## Host Sidecar Setup
 
-## Installation
-
-### 1. Cloner le dépôt
+`daily-health-check.py` runs on the **host** (not inside Docker) and collects data for the Docker, Watchtower, APT, OpenClaw, UFW, Fail2ban, WireGuard, and Services sections.
 
 ```bash
-git clone <repo>
-cd openclaw-monitoring-cost
+# Test manually
+cd ~/monitoring
+python3 daily-health-check.py
+
+# Verify output
+python3 -m json.tool data/host-health.json
+
+# Add to crontab (every 10 minutes)
+crontab -e
+# */10 * * * * cd ~/monitoring && python3 daily-health-check.py >/dev/null 2>&1
 ```
 
-### 2. Configurer les clés API
+## Optional: Google Cloud Billing
 
-**Option A — Avec OpenClaw (recommandé sur ce VPS)**
+To display real GCP spend (not just log-based estimates):
 
-Les clés sont lues automatiquement depuis `~/.openclaw/openclaw.json` :
-
-```bash
-./start.sh    # Injecte les clés OpenClaw + lance docker compose
-```
-
-Variables extraites depuis OpenClaw :
-
-| Variable OpenClaw | Variable injectée |
-|---|---|
-| `OPENAI_API_KEY_MONITORING` | `OPENAI_API_KEY` |
-| `OPENROUTER_API_KEY_MONITORING` | `OPENROUTER_API_KEY` |
-| `ANTHROPIC_API_KEY_MONITORING` | `ANTHROPIC_API_KEY` |
-
-**Option B — Sans OpenClaw (déploiement universel)**
-
-```bash
-cp .env.example .env
-# Éditer .env avec vos clés API
-docker compose up -d --build
-```
-
-Voir `.env.example` pour la liste complète et les instructions de création de clés.
-
-### 3. (Optionnel) Billing Google Cloud
-
-Si tu veux le coût GCP réel (pas seulement l'estimation logs) :
-
-1. Aller sur [GCP Console](https://console.cloud.google.com) > IAM → Service Accounts
-2. Sélectionner ton service account lié à l'API Gemini
-3. Onglet **Clés** → **Ajouter une clé** → JSON → télécharger
-4. Copier le fichier sur le host : `cp key.json ~/google-sa-key.json`
-5. S'assurer que le compte a le rôle `Billing Account Viewer`
-6. Décommenter la ligne de volume dans `docker-compose.yml` :
+1. Go to [GCP Console](https://console.cloud.google.com) > IAM > Service Accounts
+2. Select the service account linked to Gemini usage
+3. Keys tab > Add Key > JSON > download
+4. Copy to host: `cp key.json ~/google-sa-key.json`
+5. Ensure the account has the `Billing Account Viewer` role
+6. Uncomment the volume line in `docker-compose.yml`:
    ```yaml
    - ~/google-sa-key.json:/google-sa-key.json:ro
    ```
 
-### 4. (Optionnel) Billing Anthropic Console
+## Optional: Anthropic Console Billing
 
-Si tu as des crédits prépayés Anthropic :
+To display Anthropic prepaid credit balance:
 
-- **Option A** — Clé Console dédiée :
-  Créer sur [console.anthropic.com](https://console.anthropic.com) une clé avec accès billing.
-  Ajouter dans `.env` : `ANTHROPIC_CONSOLE_API_KEY=sk-ant-...`
+- **Option A** -- Dedicated Console key:
+  Create a billing-scoped key at [console.anthropic.com](https://console.anthropic.com).
+  Set `ANTHROPIC_CONSOLE_API_KEY=sk-ant-...` in `.env`.
 
-- **Option B** — Token Claude Code CLI :
-  Décommenter la ligne de volume dans `docker-compose.yml` :
+- **Option B** -- Claude Code CLI token:
+  Uncomment the volume in `docker-compose.yml`:
   ```yaml
   - ${HOME}/.claude:/claude-home:ro
   ```
-  Le dashboard lira alors le token d'authentification CLI automatiquement.
+  The dashboard reads the CLI auth token automatically.
 
-### 5. Configurer le cron job `daily-health-check.py`
-
-Ce script tourne sur le **host** (pas dans Docker) et alimente les sections **Docker**, **Watchtower**, **APT**, **OpenClaw Doctor**, **Security Audit**, **WireGuard**, **Fail2ban**, **UFW** et **Services** du dashboard.
-
-```bash
-# Tester manuellement (depuis le répertoire du projet)
-cd ~/openclaw-monitoring-cost
-python3 daily-health-check.py
-
-# Vérifier le résultat
-cat data/host-health.json | python3 -m json.tool
-
-# Ajouter en cron (toutes les 10 minutes)
-crontab -e
-# Ajouter la ligne :
-# */10 * * * * cd ~/openclaw-monitoring-cost && python3 daily-health-check.py >/dev/null 2>&1
-```
-
-Le script écrit `data/host-health.json` lu par le container via le volume partagé `./data:/data`.
-
-### 6. Lancer
-
-```bash
-# Via start.sh (Option A — injecte les clés depuis openclaw.json)
-./start.sh
-
-# Ou directement (Option B — nécessite un fichier .env)
-docker compose up -d --build
-```
-
-Dashboard disponible sur `http://localhost:8888`
-
----
-
-## Variables d'environnement
-
-Voir `.env.example` pour la liste complète.
-
-| Variable | Requis | Description |
-|---|---|---|
-| `OPENAI_API_KEY_MONITORING` | Oui | Admin key OpenAI (scope `api.usage.read`) |
-| `OPENROUTER_API_KEY_MONITORING` | Oui | Clé API OpenRouter |
-| `ANTHROPIC_API_KEY_MONITORING` | Oui | Clé API Anthropic (lecture logs) |
-| `GOOGLE_API_KEY` | Optionnel | Clé API Gemini direct |
-| `ANTHROPIC_CONSOLE_API_KEY` | Optionnel | Clé Console billing Anthropic |
-| `WATCHTOWER_API_URL` | Optionnel | URL API Watchtower (défaut : `http://host.docker.internal:8080`) |
-| `WATCHTOWER_API_TOKEN` | Optionnel | Token API Watchtower (vide = fallback sidecar) |
-| `GOOGLE_SA_KEY_PATH` | Optionnel | Chemin JSON service account GCP |
-| `BLOGWATCHER_BIN` | Optionnel | Chemin vers le binaire blogwatcher (défaut : `~/go/bin/blogwatcher`) |
-
----
-
-## Volumes Docker
-
-| Volume local | Volume container | Usage |
-|---|---|---|
-| `./data` | `/data` | SQLite + health cache + sidecar hôte |
-| `~/.openclaw/logs` | `/openclaw-logs` | Logs OpenClaw (lecture seule) |
-| `~/.openclaw/agents` | `/openclaw-sessions` | Sessions OpenClaw (lecture seule) |
-| `~/.openclaw/cron/runs` | `/openclaw-cron` | Cron runs OpenClaw — usage Claude API (lecture seule) |
-| `~/.claude` | `/claude-home` | Claude Code CLI config — **opt-in**, décommenter dans `docker-compose.yml` |
-| `~/google-sa-key.json` | `/google-sa-key.json` | Service account GCP — **opt-in**, décommenter dans `docker-compose.yml` |
-
----
-
-## Structure
+## Project Structure
 
 ```
-├── app/
-│   ├── app.py              # Dashboard Streamlit
-│   ├── collectors.py       # Collecte API par fournisseur
-│   ├── health_collector.py # Métriques système Linux (via /proc + sidecar)
-│   └── requirements.txt
-├── daily-health-check.py   # Cron job host — collecte exhaustive → data/host-health.json
-├── data/                   # SQLite + health cache (gitignored)
-├── Dockerfile
-├── docker-compose.yml
-├── .env.example
-└── README.md
+monitoring/
+  app/
+    app.py                # Streamlit dashboard
+    collectors.py         # API collectors (OpenRouter, OpenAI, Anthropic, Google, OpenClaw Gateway)
+    health_collector.py   # System metrics (via /proc + sidecar JSON)
+    requirements.txt
+  scripts/                # Utility scripts
+  daily-health-check.py   # Host sidecar cron job --> data/host-health.json
+  data/                   # SQLite + health cache (gitignored)
+  Dockerfile
+  docker-compose.yml
+  start.sh                # Injects OpenClaw keys and runs docker compose
+  .env.example
+  README.md
 ```
 
----
+## Tech Stack
 
-## Features
+- **Python 3.12** + **Streamlit** -- web dashboard
+- **streamlit-autorefresh** -- 10s UI refresh without page reload
+- **httpx** -- async HTTP client for API calls
+- **plotly** -- real-time charts (CPU, RAM, Network)
+- **psutil** -- live system metrics inside the container
+- **pandas** -- data manipulation
+- **cryptography** -- JWT signing for GCP service account auth
+- **SQLite** -- time-series cache for charts
+- **Docker** -- deployment with host networking
 
-### AI Costs (Tab 1)
-- 📊 Cards par fournisseur avec crédits restants/consommés et usage
-- 💰 Coût USD par modèle sur OpenRouter, OpenAI, Anthropic, Google
-- 🏦 Double vue Anthropic : billing API (si configuré) + estimation logs
-- 🤖 Claude Code : stats locales (sessions, messages, tokens par modèle)
-- 📅 Sélecteur de période : 1j / 7j / 30j
+## License
 
-### System Health (Tab 2)
-- 📈 Graphiques live : CPU & RAM %, Network I/O (10s refresh via SQLite)
-- 🖥️ Système : uptime, CPU%, RAM, disques multiples, réseau (via `/proc`)
-- 🐳 Docker : containers + stats live top 5 CPU
-- 🔄 Watchtower : sessions + **noms des images mises à jour**
-- 🛡️ Fail2ban : jails actives, IPs bannies
-- 🔥 UFW : blocks/heure, top IPs bloquées, détails blocks, auth failures
-- 🔒 WireGuard : interfaces, peers connectés, handshakes, trafic
-- ⚙️ Services systemd : statuts en temps réel
-- 🛠️ DevTools : GitHub CLI auth, tmux sessions
-- 📦 APT : packages mis à jour + compteur upgradable + timer auto-upgrade
-
-### OpenClaw (Tab 2)
-- 🦞 **Version** : installée vs dernière release (badge vert/rouge via blogwatcher)
-- 🩺 **Doctor structuré** : Matrix status, agents, heartbeat, sessions store, plugin errors, skills blocked, memory plugin
-- 🛡️ **Security structuré** : summary (critical/warn/info), warnings avec fix, attack surface
-- 📄 Expanders "Détails bruts" pour debug
-
-### Général
-- 🌡️ Global status badge : ✅/⚠️/❌ agrégé depuis toutes les sections
-- 🔄 Auto-refresh configurable (10s / 30s / 60s)
-- 🔔 Alertes CPU>80% / Disk<20% (opt-in)
-- 🔄 Cache persistant — données affichées même entre les refreshs
-- 🧵 Threads arrière-plan — métriques système (5 min), Webmin (30s), live collector (10s)
+MIT
