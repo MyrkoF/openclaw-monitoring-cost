@@ -743,14 +743,14 @@ def collect_claude_code():
 # ── Assemblage ─────────────────────────────────────────────────────────────────
 
 def _reuse_openclaw_from_sidecar():
-    """Réutilise les résultats openclaw du sidecar s'ils ont moins d'1 heure."""
+    """Reuse openclaw doctor/security results if less than 24h old."""
     try:
         data = json.loads(SIDECAR_PATH.read_text(encoding="utf-8"))
         ts = data.get("meta", {}).get("collected_at", "")
         if not ts:
             return None, None
         age = (datetime.now(timezone.utc) - datetime.fromisoformat(ts)).total_seconds()
-        if age < 3600:
+        if age < 86400:  # 24h — doctor/security run once per day
             return data.get("openclaw_doctor"), data.get("openclaw_security")
     except Exception:
         pass
@@ -775,7 +775,7 @@ def build_report():
 
     openclaw_version = collect_openclaw_version()
 
-    # OpenClaw checks : réutiliser le sidecar si < 1h (économise ~7s)
+    # OpenClaw checks: reuse if < 24h old (doctor/security run once/day)
     cached_doc, cached_sec = _reuse_openclaw_from_sidecar()
     doctor   = cached_doc  or collect_openclaw_doctor()
     security = cached_sec  or collect_openclaw_security()
