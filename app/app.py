@@ -151,26 +151,31 @@ def collect_webmin():
         return {"status": "error", "error": str(e)}
 
 
+# Global refresh interval (set by sidebar, read by workers)
+_g_refresh_interval = 60
+_g_webmin_data = {}
+_g_openclaw_gw_data = {}
+
 def _webmin_worker():
+    global _g_webmin_data
     while True:
         try:
-            result = collect_webmin()
-            st.session_state["webmin_live"] = result
+            _g_webmin_data = collect_webmin()
         except Exception:
             pass
-        time.sleep(30)
+        time.sleep(max(_g_refresh_interval, 30))
 
 
 def _openclaw_gw_worker():
+    global _g_openclaw_gw_data
     while True:
         try:
             result = _openclaw_gateway()
             if result is not None:
-                st.session_state["openclaw_gw_live"] = result
+                _g_openclaw_gw_data = result
         except Exception:
             pass
-        interval = st.session_state.get("_backend_refresh", 60)
-        time.sleep(max(interval, 30))
+        time.sleep(max(_g_refresh_interval, 30))
 
 
 # ── Background health refresh ────────────────────────────────────────────────
@@ -180,8 +185,7 @@ def _health_worker():
             collect_system()
         except Exception:
             pass
-        interval = st.session_state.get("_backend_refresh", 60)
-        time.sleep(max(interval, 30))
+        time.sleep(max(_g_refresh_interval, 30))
 
 if "health_thread_started" not in st.session_state:
     t = threading.Thread(target=_health_worker, daemon=True)
@@ -206,7 +210,8 @@ if "openclaw_gw_thread_started" not in st.session_state:
     try:
         _init_gw = _openclaw_gateway()
         if _init_gw is not None:
-            st.session_state["openclaw_gw_live"] = _init_gw
+            global _g_openclaw_gw_data
+            _g_openclaw_gw_data = _init_gw
     except Exception:
         pass
     threading.Thread(target=_openclaw_gw_worker, daemon=True).start()
@@ -222,7 +227,8 @@ with st.sidebar:
     _refresh_labels = {30: "30s", 60: "1min", 300: "5min", 1800: "30min", 3600: "1h", 43200: "12h"}
     refresh_interval = st.selectbox("Auto-refresh", _refresh_opts,
                                      format_func=lambda x: _refresh_labels[x], index=1)
-    st.session_state["_backend_refresh"] = refresh_interval
+    global _g_refresh_interval
+    _g_refresh_interval = refresh_interval
     alerts_enabled = st.checkbox("🔔 Alertes CPU>80% / Disk<20%")
 
     if st.button("🔄 Refresh", use_container_width=True):
@@ -290,7 +296,7 @@ with tabs[0]:
 
     # ── Usage OpenClaw (gateway live) — coût par modèle ──────────
     st.markdown(f"##### Usage OpenClaw ({period})")
-    gw_live = st.session_state.get("openclaw_gw_live") or {}
+    gw_live = _g_openclaw_gw_data or {}
     gw_all_sessions = gw_live.get("sessions", {}).get("active", [])
 
     # Filter sessions by period
@@ -758,7 +764,7 @@ with tabs[1]:
             st.caption("Aucune session SSH active")
 
     # ── ROW D — Webmin Live ──────────────────────────────────────────────────
-    wm = st.session_state.get("webmin_live", {})
+    wm = _g_webmin_data
     if wm.get("status") == "not_configured":
         st.caption("Webmin : définir WEBMIN_USER + WEBMIN_PASSWORD dans .env pour activer")
     elif wm.get("status") == "ok":
@@ -1060,7 +1066,7 @@ with tabs[1]:
         oc_ver = health.get("openclaw_version", {})
         doc_s  = health.get("doctor_structured", {})
         sec_s  = health.get("security_structured", {})
-        gw     = st.session_state.get("openclaw_gw_live") or health.get("openclaw_gateway")
+        gw     = _g_openclaw_gw_data or health.get("openclaw_gateway")
 
         if oc_ver or doc_s or sec_s or gw:
             st.markdown("#### 🦞 OpenClaw")
