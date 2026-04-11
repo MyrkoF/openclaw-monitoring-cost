@@ -200,6 +200,13 @@ if "webmin_thread_started" not in st.session_state:
     st.session_state["webmin_thread_started"] = True
 
 if "openclaw_gw_thread_started" not in st.session_state:
+    # Initial fetch before first render
+    try:
+        _init_gw = _openclaw_gateway()
+        if _init_gw is not None:
+            st.session_state["openclaw_gw_live"] = _init_gw
+    except Exception:
+        pass
     threading.Thread(target=_openclaw_gw_worker, daemon=True).start()
     st.session_state["openclaw_gw_thread_started"] = True
 
