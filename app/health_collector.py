@@ -150,38 +150,6 @@ def _watchtower_api():
         return None
 
 
-# ── OpenClaw model→provider mapping (from config) ────────────────────────────
-
-def _load_provider_map():
-    """Build model→provider mapping from OpenClaw config."""
-    conf_path = os.environ.get("OPENCLAW_CONFIG", "/openclaw-config.json")
-    try:
-        with open(conf_path) as f:
-            d = json.load(f)
-    except Exception:
-        return {}
-    defaults = d.get("agents", {}).get("defaults", {})
-    pmap = {}
-    known_providers = ("openrouter", "openai", "anthropic", "google")
-    # Parse primary + fallbacks + models keys
-    all_names = []
-    model_conf = defaults.get("model", {})
-    if isinstance(model_conf, dict):
-        if model_conf.get("primary"):
-            all_names.append(model_conf["primary"])
-        all_names.extend(model_conf.get("fallbacks", []))
-    all_names.extend(defaults.get("models", {}).keys())
-    for full in all_names:
-        parts = full.split("/")
-        if parts[0] in known_providers:
-            prov = parts[0]
-            short = "/".join(parts[1:])
-            pmap[short] = prov
-    return pmap
-
-_PROVIDER_MAP = _load_provider_map()
-
-
 # ── OpenClaw version check (GitHub Atom feed) ────────────────────────────────
 
 def _check_openclaw_latest():
@@ -250,7 +218,7 @@ def _openclaw_gateway():
         by_channel = {}
         for s in sessions:
             m = s.get("model", "unknown")
-            by_model.setdefault(m, {"tokens": 0, "cost_usd": 0, "count": 0, "provider": _PROVIDER_MAP.get(m, "?")})
+            by_model.setdefault(m, {"tokens": 0, "cost_usd": 0, "count": 0, "provider": "?"})
             by_model[m]["tokens"] += s.get("totalTokens", 0)
             by_model[m]["cost_usd"] += s.get("estimatedCostUsd", 0)
             by_model[m]["count"] += 1
@@ -346,6 +314,29 @@ def _openclaw_gateway():
         result["cron"] = {"count": len(cron_jobs), "jobs": cron_jobs}
     except Exception as e:
         result["errors"].append(f"cron: {e}")
+
+    # ── Build provider map from API data (cron payloads + session_status) ──
+    _known = ("openrouter", "openai", "anthropic", "google")
+    prov_map = {}
+    # From cron job payloads (e.g. "openai/gpt-4o-mini")
+    for j in result.get("cron", {}).get("jobs", []):
+        full = j.get("model", "")
+        parts = full.split("/", 1)
+        if len(parts) == 2 and parts[0] in _known:
+            prov_map[parts[1]] = parts[0]
+    # From session_status text (e.g. "Model: openrouter/moonshotai/kimi-k2.5")
+    for line in result.get("session_status_text", "").splitlines():
+        if "Model:" in line:
+            for token in line.split():
+                parts = token.split("/", 1)
+                if len(parts) == 2 and parts[0] in _known:
+                    prov_map[parts[1]] = parts[0]
+                    break
+    # Apply provider to by_model
+    if prov_map and "sessions" in result:
+        for m, v in result["sessions"]["by_model"].items():
+            if v.get("provider") == "?":
+                v["provider"] = prov_map.get(m, "?")
 
     if len(result["errors"]) == 4:
         return None  # total failure → fallback sidecar
