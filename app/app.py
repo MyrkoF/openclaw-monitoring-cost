@@ -1256,8 +1256,8 @@ with tabs[1]:
 with tabs[2]:
     st.json(data)
 
-if "initial_render_done" not in st.session_state:
-    st.session_state["initial_render_done"] = True
-else:
-    time.sleep(refresh_interval)
-    st.rerun()
+# Auto-refresh via meta tag (no blocking sleep)
+st.markdown(
+    f'<meta http-equiv="refresh" content="{refresh_interval}">',
+    unsafe_allow_html=True,
+)
