@@ -10,7 +10,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import psutil
 from collectors import collect_all
-from health_collector import collect_system, HEALTH_CACHE
+from health_collector import collect_system, HEALTH_CACHE, _openclaw_gateway
 
 st.set_page_config(page_title="AI Monitor", page_icon="📊", layout="wide")
 
@@ -161,6 +161,17 @@ def _webmin_worker():
         time.sleep(30)
 
 
+def _openclaw_gw_worker():
+    while True:
+        try:
+            result = _openclaw_gateway()
+            if result is not None:
+                st.session_state["openclaw_gw_live"] = result
+        except Exception:
+            pass
+        time.sleep(30)
+
+
 # ── Background health refresh (5 min) ─────────────────────────────────────────
 def _health_worker():
     while True:
@@ -187,6 +198,10 @@ if "live_collector_started" not in st.session_state:
 if "webmin_thread_started" not in st.session_state:
     threading.Thread(target=_webmin_worker, daemon=True).start()
     st.session_state["webmin_thread_started"] = True
+
+if "openclaw_gw_thread_started" not in st.session_state:
+    threading.Thread(target=_openclaw_gw_worker, daemon=True).start()
+    st.session_state["openclaw_gw_thread_started"] = True
 
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
@@ -1002,12 +1017,13 @@ with tabs[1]:
                     unsafe_allow_html=True,
                 )
 
-        # ── OpenClaw card — structured doctor/security + version ────────────
+        # ── OpenClaw card — structured doctor/security + version + gateway live ─
         oc_ver = health.get("openclaw_version", {})
         doc_s  = health.get("doctor_structured", {})
         sec_s  = health.get("security_structured", {})
+        gw     = st.session_state.get("openclaw_gw_live") or health.get("openclaw_gateway")
 
-        if oc_ver or doc_s or sec_s:
+        if oc_ver or doc_s or sec_s or gw:
             st.markdown("#### 🦞 OpenClaw")
             oc_cols = st.columns(2)
 
@@ -1031,11 +1047,14 @@ with tabs[1]:
                     f'<div class="model-row"><span>Matrix</span>'
                     f'<span class="badge badge-green">{matrix["status"]} ({matrix["latency"]})</span></div>'
                 ) if matrix else ""
-                agents = doc_s.get("agents", [])
+                # Agents — prefer gateway count (live) over doctor (sidecar)
+                gw_agents = gw.get("agents", {}) if gw else {}
+                doc_agents = doc_s.get("agents", [])
+                agents_count = gw_agents.get("count") or len(doc_agents)
                 agents_row = (
                     f'<div class="model-row"><span>Agents</span>'
-                    f'<span class="badge">{len(agents)}</span></div>'
-                ) if agents else ""
+                    f'<span class="badge">{agents_count}</span></div>'
+                ) if agents_count else ""
                 hb = doc_s.get("heartbeat")
                 hb_row = (
                     f'<div class="model-row"><span>Heartbeat</span>'
@@ -1071,15 +1090,63 @@ with tabs[1]:
                     for c in compat
                 )
 
+                # Gateway live rows (sessions, cost, tokens)
+                gw_rows = ""
+                gw_badge = ""
+                if gw and gw.get("sessions"):
+                    gs = gw["sessions"]
+                    gw_badge = ' <span class="badge badge-green" style="font-size:10px!important">LIVE</span>'
+                    gw_rows = (
+                        f'<div class="model-row"><span>Live Sessions</span>'
+                        f'<span class="badge badge-green">{gs["count"]}</span></div>'
+                        f'<div class="model-row"><span>Total Cost</span>'
+                        f'<span class="badge">${gs["total_cost_usd"]:.4f}</span></div>'
+                        f'<div class="model-row"><span>Total Tokens</span>'
+                        f'<span class="badge">{gs["total_tokens"]:,}</span></div>'
+                    )
+                    # By channel breakdown
+                    for ch, cnt in gs.get("by_channel", {}).items():
+                        gw_rows += (
+                            f'<div class="model-row"><span>&nbsp;&nbsp;{ch}</span>'
+                            f'<span class="badge">{cnt}</span></div>'
+                        )
+
                 st.markdown(
                     f'<div class="card">'
-                    f'<div class="card-header">🦞 OpenClaw {ver_badge} {doc_icon}</div>'
-                    f'{matrix_row}{agents_row}{hb_row}{sess_row}{mem_row}{pe_row}{sb_row}{compat_rows}'
+                    f'<div class="card-header">🦞 OpenClaw {ver_badge} {doc_icon}{gw_badge}</div>'
+                    f'{matrix_row}{agents_row}{hb_row}{sess_row}{gw_rows}{mem_row}{pe_row}{sb_row}{compat_rows}'
                     f'</div>',
                     unsafe_allow_html=True,
                 )
 
-                # Session activity
+                # Live sessions detail (gateway)
+                if gw and gw.get("sessions", {}).get("active"):
+                    active_sessions = gw["sessions"]["active"]
+                    with st.expander(f"Live Sessions ({len(active_sessions)})"):
+                        for s in active_sessions:
+                            name = s["name"]
+                            if len(name) > 40:
+                                name = name[:37] + "..."
+                            st.caption(
+                                f"  {name} · {s['model']} · {s['channel']} · "
+                                f"{s['tokens']:,} tok · ${s['cost_usd']:.4f} · {s['status']} · {s['updated']}"
+                            )
+
+                # Cron jobs detail (gateway)
+                if gw and gw.get("cron", {}).get("jobs"):
+                    cron_jobs = gw["cron"]["jobs"]
+                    all_ok = all(j["last_status"] == "ok" and j["consecutive_errors"] == 0 for j in cron_jobs)
+                    cron_icon = "✅" if all_ok else "⚠️"
+                    with st.expander(f"Cron Jobs ({len(cron_jobs)}) {cron_icon}"):
+                        for j in cron_jobs:
+                            status_icon = "✅" if j["last_status"] == "ok" else "❌"
+                            err_note = f" · {j['consecutive_errors']} errors" if j["consecutive_errors"] else ""
+                            st.caption(
+                                f"  {status_icon} {j['name']} · {j['schedule']} ({j['tz']}) · "
+                                f"{j['model']} · {j['last_duration_s']}s{err_note} · next: {j['next_run']}"
+                            )
+
+                # Session activity (sidecar doctor)
                 activity = doc_s.get("session_activity", [])
                 if activity:
                     with st.expander(f"Sessions récentes ({len(activity)})"):

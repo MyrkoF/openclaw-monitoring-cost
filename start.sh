@@ -27,10 +27,22 @@ export DB_PATH="/data/monitoring.db"
 export OPENCLAW_LOGS_DIR="/openclaw-logs"
 export OPENCLAW_SESSIONS_DIR="/openclaw-sessions"
 
+# OpenClaw Gateway API token (live sessions/agents)
+# Read from JSON config directly (CLI redacts sensitive values)
+if [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]; then
+  OPENCLAW_JSON="${HOME}/.openclaw/openclaw.json"
+  if [ -f "$OPENCLAW_JSON" ]; then
+    OPENCLAW_GATEWAY_TOKEN=$(python3 -c "import json; print(json.load(open('$OPENCLAW_JSON')).get('gateway',{}).get('auth',{}).get('token',''))" 2>/dev/null || echo "")
+  fi
+fi
+export OPENCLAW_GATEWAY_TOKEN
+export OPENCLAW_GATEWAY_URL="https://host.docker.internal:18789"
+
 echo "🔑 Clés monitoring chargées depuis OpenClaw :"
 echo "   OpenAI Mon    : ${OPENAI_API_KEY_MONITORING:0:20}..."
 echo "   OpenRouter Mon: ${OPENROUTER_API_KEY_MONITORING:0:20}..."
 echo "   Anthropic Mon : ${ANTHROPIC_API_KEY_MONITORING:0:20}..."
+echo "   OpenClaw GW   : ${OPENCLAW_GATEWAY_TOKEN:+configured}${OPENCLAW_GATEWAY_TOKEN:-not set}"
 
 docker compose up -d "$@"
 

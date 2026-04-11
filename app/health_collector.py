@@ -150,6 +150,145 @@ def _watchtower_api():
         return None
 
 
+# ── OpenClaw Gateway API (live sessions/agents) ─────────────────────────────
+
+def _gw_invoke(url, token, ctx, tool_name, action="json"):
+    """POST /tools/invoke → parse details from response."""
+    import urllib.request
+    data = json.dumps({"tool": tool_name, "action": action, "args": {}}).encode()
+    req = urllib.request.Request(
+        f"{url.rstrip('/')}/tools/invoke",
+        data=data,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=8, context=ctx) as resp:
+        body = json.loads(resp.read().decode())
+    if not body.get("ok"):
+        raise RuntimeError(body.get("error", {}).get("message", "unknown error"))
+    return body["result"].get("details", body["result"])
+
+
+def _openclaw_gateway():
+    """Query OpenClaw gateway for live session/agent data. Returns dict or None."""
+    url   = os.environ.get("OPENCLAW_GATEWAY_URL", "https://host.docker.internal:18789")
+    token = os.environ.get("OPENCLAW_GATEWAY_TOKEN", "")
+    if not token:
+        return None
+
+    import ssl
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    result = {"status": "ok", "collected_at": datetime.utcnow().isoformat(), "errors": []}
+
+    # ── sessions_list ──
+    try:
+        sl = _gw_invoke(url, token, ctx, "sessions_list")
+        sessions = sl.get("sessions", [])
+        total_cost = sum(s.get("estimatedCostUsd", 0) for s in sessions)
+        total_tokens = sum(s.get("totalTokens", 0) for s in sessions)
+        by_model = {}
+        by_channel = {}
+        for s in sessions:
+            m = s.get("model", "unknown")
+            by_model.setdefault(m, {"tokens": 0, "cost_usd": 0, "count": 0})
+            by_model[m]["tokens"] += s.get("totalTokens", 0)
+            by_model[m]["cost_usd"] += s.get("estimatedCostUsd", 0)
+            by_model[m]["count"] += 1
+            ch = s.get("channel", "unknown")
+            by_channel.setdefault(ch, 0)
+            by_channel[ch] += 1
+        active = [
+            {
+                "key": s.get("key", ""),
+                "name": s.get("displayName", s.get("label", s.get("key", "?"))),
+                "model": s.get("model", "?"),
+                "channel": s.get("channel", "?"),
+                "tokens": s.get("totalTokens", 0),
+                "cost_usd": round(s.get("estimatedCostUsd", 0), 6),
+                "status": s.get("status", "?"),
+                "updated": datetime.utcfromtimestamp(s["updatedAt"] / 1000).strftime("%H:%M:%S")
+                           if s.get("updatedAt") else "?",
+            }
+            for s in sessions
+        ]
+        result["sessions"] = {
+            "count": sl.get("count", len(sessions)),
+            "total_cost_usd": round(total_cost, 6),
+            "total_tokens": total_tokens,
+            "by_model": by_model,
+            "by_channel": by_channel,
+            "active": active,
+        }
+    except Exception as e:
+        result["errors"].append(f"sessions_list: {e}")
+
+    # ── agents_list ──
+    try:
+        al = _gw_invoke(url, token, ctx, "agents_list")
+        agents = al.get("agents", [])
+        result["agents"] = {
+            "count": len(agents),
+            "list": [{"id": a.get("id", "?"), "name": a.get("name", a.get("id", "?"))} for a in agents],
+        }
+    except Exception as e:
+        result["errors"].append(f"agents_list: {e}")
+
+    # ── session_status (version) ──
+    try:
+        ss = _gw_invoke(url, token, ctx, "session_status")
+        status_text = ss.get("statusText", "")
+        version = ""
+        for line in status_text.splitlines():
+            if "OpenClaw" in line:
+                parts = line.split()
+                for p in parts:
+                    if p and p[0].isdigit():
+                        version = p
+                        break
+                break
+        result["version"] = version or "?"
+        result["session_status_text"] = status_text
+    except Exception as e:
+        result["errors"].append(f"session_status: {e}")
+
+    # ── cron (job list + status) ──
+    try:
+        cl = _gw_invoke(url, token, ctx, "cron", action="list")
+        jobs = cl.get("jobs", [])
+        cron_jobs = []
+        for j in jobs:
+            state = j.get("state", {})
+            last_run_ms = state.get("lastRunAtMs")
+            next_run_ms = state.get("nextRunAtMs")
+            cron_jobs.append({
+                "name": j.get("name", "?"),
+                "enabled": j.get("enabled", False),
+                "schedule": j.get("schedule", {}).get("expr", "?"),
+                "tz": j.get("schedule", {}).get("tz", "?"),
+                "model": j.get("payload", {}).get("model", "?"),
+                "last_status": state.get("lastRunStatus", "?"),
+                "last_duration_s": round(state.get("lastDurationMs", 0) / 1000, 1),
+                "last_run": datetime.utcfromtimestamp(last_run_ms / 1000).strftime("%Y-%m-%d %H:%M UTC")
+                            if last_run_ms else "?",
+                "next_run": datetime.utcfromtimestamp(next_run_ms / 1000).strftime("%Y-%m-%d %H:%M UTC")
+                            if next_run_ms else "?",
+                "consecutive_errors": state.get("consecutiveErrors", 0),
+                "delivery": j.get("delivery", {}).get("mode", "none"),
+            })
+        result["cron"] = {"count": len(cron_jobs), "jobs": cron_jobs}
+    except Exception as e:
+        result["errors"].append(f"cron: {e}")
+
+    if len(result["errors"]) == 4:
+        return None  # total failure → fallback sidecar
+    if result["errors"]:
+        result["status"] = "partial"
+    return result
+
+
 # ── Lecture du sidecar hôte ───────────────────────────────────────────────────
 
 def _load_sidecar():
@@ -175,6 +314,9 @@ def collect_system():
     # Watchtower — API HTTP opt-in uniquement (aucun docker.sock nécessaire)
     wt_api    = _watchtower_api()
     wt_source = "api" if wt_api is not None else "sidecar"
+
+    # OpenClaw Gateway API — live sessions/agents
+    gw_data   = _openclaw_gateway()
 
     # ── Données hôte depuis le sidecar (daily-health-check.py) ──────────────
     sidecar = _load_sidecar()
@@ -234,6 +376,9 @@ def collect_system():
     docker_stats = sidecar.get("docker", {}).get("docker_stats", [])
     disks        = sidecar.get("resources", {}).get("disks", [])
     openclaw_version = sidecar.get("openclaw_version", {})
+    # Prefer gateway version (live) over sidecar version (10min stale)
+    if gw_data and gw_data.get("version"):
+        openclaw_version = {**openclaw_version, "installed": gw_data["version"], "source": "gateway"}
     wt_image_updates = sidecar.get("watchtower", {}).get("image_updates", [])
 
     # Métadonnées sidecar
@@ -280,6 +425,7 @@ def collect_system():
         "wt_image_updates":   wt_image_updates,
         "sidecar_at":         sidecar_at,
         "sidecar_stale":      _is_stale(sidecar_at),
+        "openclaw_gateway":   gw_data,
     }
 
     # Écrire le cache

@@ -22,6 +22,9 @@ services:
       # Watchtower HTTP API (optionnel — fallback: sidecar host-health.json)
       - WATCHTOWER_API_URL=${WATCHTOWER_API_URL:-http://host.docker.internal:8080}
       - WATCHTOWER_API_TOKEN=${WATCHTOWER_API_TOKEN:-}
+      # OpenClaw Gateway API (optionnel — live sessions/agents)
+      - OPENCLAW_GATEWAY_URL=${OPENCLAW_GATEWAY_URL:-https://host.docker.internal:18789}
+      - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN:-}
       # Webmin (optionnel — monitoring host via XML-RPC)
       - WEBMIN_URL=${WEBMIN_URL:-https://host.docker.internal:10000/xmlrpc.cgi}
       - WEBMIN_USER=${WEBMIN_USER:-}
