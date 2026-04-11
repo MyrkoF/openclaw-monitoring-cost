@@ -2,20 +2,44 @@
 
 ## Supported Versions
 
-Use this section to tell people about which versions of your project are
-currently being supported with security updates.
-
 | Version | Supported          |
-| ------- | ------------------ |
-| 5.1.x   | :white_check_mark: |
-| 5.0.x   | :x:                |
-| 4.0.x   | :white_check_mark: |
-| < 4.0   | :x:                |
+|---------|--------------------|
+| 1.0.x   | :white_check_mark: |
 
 ## Reporting a Vulnerability
 
-Use this section to tell people how to report a vulnerability.
+If you discover a security vulnerability, please report it responsibly:
 
-Tell them where to go, how often they can expect to get an update on a
-reported vulnerability, what to expect if the vulnerability is accepted or
-declined, etc.
+1. **Do not** open a public issue
+2. Email: **myrko@federico.pro**
+3. Include: description, steps to reproduce, and potential impact
+
+You should receive a response within 72 hours.
+
+## Security Considerations
+
+This dashboard is designed for **self-hosted, single-user** deployments behind a VPN. It is **not** intended to be exposed to the public internet.
+
+### API Keys
+
+- API keys are injected via environment variables at runtime
+- Keys are **never** hardcoded or committed to the repository
+- `start.sh` reads keys from the OpenClaw keystore (`~/.openclaw/.env`)
+- The `.env` file is gitignored
+
+### Network
+
+- The container runs with `network_mode: host` to access local services (OpenClaw gateway on `127.0.0.1:18789`)
+- The dashboard listens on port `8888` -- restrict access via firewall (UFW) or VPN
+- The OpenClaw gateway uses self-signed TLS; certificate verification is disabled for localhost connections only
+
+### Data
+
+- No data is sent to external services beyond the configured AI provider APIs
+- Health data (host metrics, Docker stats) stays local in `data/host-health.json`
+- SQLite metrics database is local and gitignored
+
+### Secrets in Gateway Token
+
+- The OpenClaw gateway token (`OPENCLAW_GATEWAY_TOKEN`) is read from `~/.openclaw/openclaw.json` at startup
+- It is passed to the container via environment variable, never stored in files inside the container
