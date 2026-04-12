@@ -609,11 +609,55 @@ with tabs[0]:
                 f'<div class="sub-num grey" style="margin-top:4px">Local CLI stats · updated {last_computed}</div>'
             )
 
+        # Claude-cli section (Max subscription — subprocess sessions)
+        cli_data = (_g["gw"] or {}).get("claude_cli", {})
+        cli_html = ""
+        if cli_data:
+            msg_h = cli_data.get("messages_this_hour", 0)
+            limit_h = cli_data.get("estimated_limit_hour", 60)
+            model = cli_data.get("current_model", "?")
+            today_msg = cli_data.get("today_messages", 0)
+            today_tok = cli_data.get("today_tokens", 0)
+            today_cost = cli_data.get("today_cost_estimated", 0)
+            cli_sess = cli_data.get("cli_sessions", [])
+
+            # Rate limit bar
+            rate_pct = min(round(msg_h / limit_h * 100, 1), 100) if limit_h else 0
+            _clr = lambda pct: "#48bb78" if pct < 70 else ("#ecc94b" if pct < 90 else "#fc8181")
+
+            cli_html = (
+                f'<hr class="divider">'
+                f'<div class="sub-num grey" style="margin-bottom:4px">Claude-cli (Max subscription)</div>'
+                f'<div class="model-row"><span>Rate limit ({model})</span>'
+                f'<span><span class="badge">{msg_h} / ~{limit_h} msg/h</span></span></div>'
+                f'<div class="prog-bar-bg"><div class="prog-bar-fill" style="width:{rate_pct}%;background:{_clr(rate_pct)}"></div></div>'
+                f'<div class="model-row" style="margin-top:4px"><span>Today</span>'
+                f'<span><span class="badge">{today_msg} msg</span>'
+                f'<span class="badge">{today_tok:,} tok</span>'
+                f'<span class="badge" style="color:#48bb78">~${today_cost:.4f}</span></span></div>'
+            )
+
+            # Session list
+            if cli_sess:
+                sess_rows = ""
+                for s in cli_sess[:5]:
+                    from datetime import datetime as _dt, timezone as _tz
+                    ts = _dt.fromtimestamp(s["started_at_ms"] / 1000, tz=_tz.utc).strftime("%H:%M") if s["started_at_ms"] else "?"
+                    sess_rows += (
+                        f'<div class="model-row"><span>{s["agent"]}:{s["session_id"]}</span>'
+                        f'<span><span class="badge">{s["status"]}</span>'
+                        f'<span class="badge">{s["runtime_s"]}s</span>'
+                        f'<span class="badge">{s["tokens"]:,} tok</span>'
+                        f'<span class="badge">{ts}</span></span></div>'
+                    )
+                cli_html += f'<div class="sub-num grey" style="margin-top:6px">Subprocess sessions</div>{sess_rows}'
+
         st.markdown(
             f'<div class="card">'
             f'<div class="card-header">🧠 Anthropic{cc_badge}</div>'
             f'{billing_html}'
             f'{cc_html}'
+            f'{cli_html}'
             f'</div>',
             unsafe_allow_html=True,
         )
@@ -1229,6 +1273,21 @@ with tabs[1]:
                         for a in activity:
                             short_name = a["name"].replace("agent:main:", "")
                             st.caption(f"  {short_name} — {a['ago']}")
+
+                # Claude-cli subprocess sessions (all agents)
+                _cli = (gw.get("claude_cli", {}) if gw else {})
+                _all_cli = _cli.get("cli_sessions", []) + _cli.get("api_sessions", [])
+                if _all_cli:
+                    with st.expander(f"Claude subprocess sessions ({len(_all_cli)})"):
+                        for s in _all_cli:
+                            from datetime import datetime as _dt, timezone as _tz
+                            ts = _dt.fromtimestamp(s["started_at_ms"] / 1000, tz=_tz.utc).strftime("%m-%d %H:%M") if s["started_at_ms"] else "?"
+                            prov_label = "cli" if s["provider"] == "claude-cli" else "api"
+                            cost_label = "included" if s["provider"] == "claude-cli" and s["cost_usd"] == 0 else f"${s['cost_usd']:.4f}"
+                            st.caption(
+                                f"  {s['agent']}:{s['session_id']} · {prov_label} · {s['model']} · "
+                                f"{s['status']} · {s['runtime_s']}s · {s['tokens']:,} tok · {cost_label} · {ts}"
+                            )
 
             with oc_cols[1]:
                 # Security summary

@@ -150,6 +150,113 @@ def _watchtower_api():
         return None
 
 
+# ── Claude-cli subprocess usage (rate limits + session tracking) ─────────────
+
+_CLAUDE_MAX_LIMITS = {
+    "claude-opus-4": 45,
+    "claude-opus-4-6": 45,
+    "claude-sonnet-4-6": 80,
+    "claude-sonnet-4-5": 80,
+    "claude-haiku-4-5": 200,
+}
+
+def _collect_claude_cli_usage():
+    """Collect claude-cli subprocess sessions + estimate hourly rate limit usage."""
+    import glob as _glob
+    sessions_dir = os.environ.get("OPENCLAW_SESSIONS_DIR", "/openclaw-sessions")
+    now = _time.time()
+    hour_ago = now - 3600
+    day_start = now - (now % 86400)  # UTC midnight
+
+    cli_sessions = []
+    api_sessions = []
+    messages_this_hour = 0
+    today_tokens = 0
+    today_messages = 0
+    today_cost = 0.0
+    current_model = None
+
+    for sf in _glob.glob(f"{sessions_dir}/*/sessions/sessions.json"):
+        agent = sf.split("/")[-3]
+        try:
+            with open(sf) as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        for sid, s in data.items():
+            mp = s.get("modelProvider", "")
+            model = s.get("model", "")
+            if "claude" not in model.lower():
+                continue
+
+            entry = {
+                "agent": agent,
+                "session_id": s.get("sessionId", sid)[:12],
+                "provider": mp,
+                "model": model,
+                "channel": s.get("channel", "?"),
+                "status": s.get("status", "?"),
+                "tokens": s.get("totalTokens", 0),
+                "input_tokens": s.get("inputTokens", 0),
+                "output_tokens": s.get("outputTokens", 0),
+                "cache_read": s.get("cacheRead", 0),
+                "cost_usd": round(s.get("estimatedCostUsd", 0), 6),
+                "started_at_ms": s.get("startedAt", 0),
+                "ended_at_ms": s.get("endedAt", 0),
+                "runtime_s": round(s.get("runtimeMs", 0) / 1000, 1),
+            }
+
+            if mp == "claude-cli":
+                cli_sessions.append(entry)
+                current_model = model
+                # Count messages from JSONL for rate limit estimation
+                jsonl_path = s.get("sessionFile", "")
+                if not jsonl_path:
+                    jsonl_path = os.path.join(os.path.dirname(sf), f"{s.get('sessionId','')}.jsonl")
+                if os.path.exists(jsonl_path):
+                    try:
+                        with open(jsonl_path) as jf:
+                            for line in jf:
+                                try:
+                                    d = json.loads(line)
+                                    ts_str = d.get("timestamp", "")
+                                    usage = d.get("message", {}).get("usage") if isinstance(d.get("message"), dict) else None
+                                    if not usage:
+                                        usage = d.get("usage")
+                                    if usage and ts_str:
+                                        msg_ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
+                                        if msg_ts >= hour_ago:
+                                            messages_this_hour += 1
+                                        if msg_ts >= day_start:
+                                            today_messages += 1
+                                            today_tokens += usage.get("totalTokens", usage.get("input", 0) + usage.get("output", 0))
+                                            cost = usage.get("cost", {})
+                                            if isinstance(cost, dict):
+                                                today_cost += cost.get("total", 0)
+                                            elif isinstance(cost, (int, float)):
+                                                today_cost += cost
+                                except Exception:
+                                    continue
+                    except Exception:
+                        pass
+            elif mp == "anthropic":
+                api_sessions.append(entry)
+
+    # Estimate limit based on current model
+    limit = _CLAUDE_MAX_LIMITS.get(current_model, 60)
+
+    return {
+        "cli_sessions": sorted(cli_sessions, key=lambda x: x["started_at_ms"], reverse=True),
+        "api_sessions": sorted(api_sessions, key=lambda x: x["started_at_ms"], reverse=True),
+        "messages_this_hour": messages_this_hour,
+        "estimated_limit_hour": limit,
+        "current_model": current_model,
+        "today_tokens": today_tokens,
+        "today_messages": today_messages,
+        "today_cost_estimated": round(today_cost, 6),
+    }
+
+
 # ── OpenClaw version check (GitHub Atom feed) ────────────────────────────────
 
 def _check_openclaw_latest():
@@ -285,6 +392,12 @@ def _openclaw_gateway():
         latest = _check_openclaw_latest()
         if latest:
             result["latest_stable"] = latest
+    except Exception:
+        pass
+
+    # ── claude-cli usage + sessions ──
+    try:
+        result["claude_cli"] = _collect_claude_cli_usage()
     except Exception:
         pass
 
