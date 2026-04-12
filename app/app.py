@@ -1375,13 +1375,13 @@ with tabs[2]:
 
 # Auto-refresh: fragment reruns itself every 30s and triggers full rerun
 # only when backend data has actually changed (no unnecessary visual flash)
+_g["_last_ts"] = _g.get("_last_ts", "")
+
 @st.fragment(run_every=timedelta(seconds=30))
 def _auto_refresh():
     gw_ts = _g["gw"].get("collected_at", "")
-    if "last_gw_ts" not in st.session_state:
-        st.session_state["last_gw_ts"] = gw_ts
-    if gw_ts != st.session_state["last_gw_ts"]:
-        st.session_state["last_gw_ts"] = gw_ts
+    if gw_ts and gw_ts != _g["_last_ts"]:
+        _g["_last_ts"] = gw_ts
         st.rerun(scope="app")
 
 _auto_refresh()
