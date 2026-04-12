@@ -318,22 +318,35 @@ def _openclaw_gateway():
     except Exception as e:
         result["errors"].append(f"cron: {e}")
 
-    # ── Build provider map from API data (cron payloads + session_status) ──
-    _known = ("openrouter", "openai", "anthropic", "google")
+    # ── Build provider map from multiple sources ──
+    _known = ("openrouter", "openai", "anthropic", "google", "claude-cli", "openai-codex")
     prov_map = {}
-    # From cron job payloads (e.g. "openai/gpt-4o-mini")
+    # Source 1: sessions.json files (most reliable — has modelProvider field)
+    _sessions_dir = os.environ.get("OPENCLAW_SESSIONS_DIR", "/openclaw-sessions")
+    try:
+        import glob as _glob
+        for sf in _glob.glob(f"{_sessions_dir}/*/sessions/sessions.json"):
+            with open(sf) as _f:
+                for _sess in json.load(_f).values():
+                    mp = _sess.get("modelProvider", "")
+                    model = _sess.get("model", "")
+                    if mp and model:
+                        prov_map[model] = mp
+    except Exception:
+        pass
+    # Source 2: cron job payloads (e.g. "openai/gpt-4o-mini")
     for j in result.get("cron", {}).get("jobs", []):
         full = j.get("model", "")
         parts = full.split("/", 1)
         if len(parts) == 2 and parts[0] in _known:
-            prov_map[parts[1]] = parts[0]
-    # From session_status text (e.g. "Model: openrouter/moonshotai/kimi-k2.5")
+            prov_map.setdefault(parts[1], parts[0])
+    # Source 3: session_status text (e.g. "Model: claude-cli/claude-sonnet-4-6")
     for line in result.get("session_status_text", "").splitlines():
         if "Model:" in line:
             for token in line.split():
                 parts = token.split("/", 1)
                 if len(parts) == 2 and parts[0] in _known:
-                    prov_map[parts[1]] = parts[0]
+                    prov_map.setdefault(parts[1], parts[0])
                     break
     # Apply provider to by_model
     if prov_map and "sessions" in result:

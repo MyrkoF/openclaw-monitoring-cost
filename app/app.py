@@ -322,7 +322,8 @@ with tabs[0]:
         total_tokens = sum(v["tokens"] for v in gw_by_model.values())
         total_sessions = sum(v["count"] for v in gw_by_model.values())
 
-        _PROV_ICONS = {"openrouter": "🔀", "openai": "🤖", "anthropic": "🧠", "google": "🌐"}
+        _PROV_ICONS = {"openrouter": "🔀", "openai": "🤖", "anthropic": "🧠", "google": "🌐",
+                       "claude-cli": "🧠", "openai-codex": "🤖"}
         model_rows = ""
         for m, v in sorted_models:
             cost = v.get("cost_usd", 0)
@@ -331,6 +332,12 @@ with tabs[0]:
             prov = v.get("provider", "?")
             prov_icon = _PROV_ICONS.get(prov, "")
             prov_badge = f'<span class="badge" style="font-size:10px!important">{prov_icon} {prov}</span>' if prov != "?" else ""
+            # claude-cli and openai-codex: $0 cost = included in subscription
+            cost_badge = (
+                '<span class="badge" style="color:#48bb78">included</span>'
+                if cost == 0 and prov in ("claude-cli", "openai-codex")
+                else f'<span class="badge badge-green">${cost:.4f}</span>'
+            )
             model_rows += (
                 f'<div class="model-row">'
                 f'<span style="max-width:40%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block">{m}</span>'
@@ -338,7 +345,7 @@ with tabs[0]:
                 f'{prov_badge}'
                 f'<span class="badge">{count} sess</span>'
                 f'<span class="badge">{tokens:,} tok</span>'
-                f'<span class="badge badge-green">${cost:.4f}</span>'
+                f'{cost_badge}'
                 f'</span></div>'
             )
         clr = "yellow" if total_cost > 1 else "green"
