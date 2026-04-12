@@ -1284,6 +1284,16 @@ with tabs[1]:
 with tabs[2]:
     st.json(data)
 
-# UI auto-refresh (10s) — just re-reads data already collected by backend workers
-from streamlit_autorefresh import st_autorefresh
-st_autorefresh(interval=10_000, key="auto_refresh")
+# Auto-refresh: fragment reruns itself every 30s and triggers full rerun
+# only when backend data has actually changed (no unnecessary visual flash)
+@st.fragment(run_every=timedelta(seconds=30))
+def _auto_refresh():
+    gw_ts = _g["gw"].get("collected_at", "")
+    if "last_gw_ts" not in st.session_state:
+        st.session_state["last_gw_ts"] = gw_ts
+    if gw_ts != st.session_state["last_gw_ts"]:
+        st.session_state["last_gw_ts"] = gw_ts
+        st.rerun(scope="app")
+
+_auto_refresh()
+
