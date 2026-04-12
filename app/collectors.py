@@ -18,6 +18,7 @@ CLAUDE_HOME           = os.environ.get("CLAUDE_HOME", "/claude-home")
 OPENROUTER_API_KEY    = os.environ.get("OPENROUTER_API_KEY", "")
 GOOGLE_API_KEY        = os.environ.get("GOOGLE_API_KEY", "")
 GOOGLE_SA_KEY_PATH    = os.environ.get("GOOGLE_SA_KEY_PATH", "/google-sa-key.json")
+CHATGPT_OAUTH_TOKEN   = os.environ.get("CHATGPT_OAUTH_TOKEN", "")
 OPENCLAW_LOGS_DIR     = os.environ.get("OPENCLAW_LOGS_DIR", "/openclaw-logs")
 OPENCLAW_SESSIONS_DIR = os.environ.get("OPENCLAW_SESSIONS_DIR", "/openclaw-sessions")
 OPENCLAW_CRON_DIR     = os.environ.get("OPENCLAW_CRON_DIR", "/openclaw-cron")
@@ -269,6 +270,60 @@ def collect_openai(days=30):
         }
     except Exception as e:
         return {"provider": "openai", "status": "error", "error": str(e)}
+
+
+# ─── ChatGPT Plus (OAuth) ──────────────────────────────────────────────────────
+
+def collect_chatgpt_plus():
+    """Collect ChatGPT Plus account info + rate limits via OAuth token."""
+    if not CHATGPT_OAUTH_TOKEN:
+        return {"status": "no_token"}
+    hdrs = {"Authorization": f"Bearer {CHATGPT_OAUTH_TOKEN}"}
+    try:
+        # /v1/me — account info, plan type, org
+        r_me = httpx.get("https://api.openai.com/v1/me", headers=hdrs, timeout=10)
+        me = r_me.json()
+        auth = me.get("https://api.openai.com/auth", {})
+        # If /v1/me doesn't have auth claims, try decoding from token
+        if not auth:
+            import base64
+            parts = CHATGPT_OAUTH_TOKEN.split(".")
+            if len(parts) >= 2:
+                payload = parts[1] + "=" * (4 - len(parts[1]) % 4)
+                claims = json.loads(base64.urlsafe_b64decode(payload))
+                auth = claims.get("https://api.openai.com/auth", {})
+
+        plan = auth.get("chatgpt_plan_type", "unknown")
+        user_id = me.get("id", auth.get("chatgpt_user_id", "?"))
+        name = me.get("name", "")
+        email = me.get("https://api.openai.com/profile", {}).get("email", "")
+
+        # Rate limits — make a minimal completion to read headers
+        rate_limits = {}
+        try:
+            r_rl = httpx.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={**hdrs, "Content-Type": "application/json"},
+                json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "1"}], "max_tokens": 1},
+                timeout=10,
+            )
+            for h in ("x-ratelimit-limit-requests", "x-ratelimit-limit-tokens",
+                       "x-ratelimit-remaining-requests", "x-ratelimit-remaining-tokens",
+                       "x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"):
+                if h in r_rl.headers:
+                    rate_limits[h.replace("x-ratelimit-", "")] = r_rl.headers[h]
+        except Exception:
+            pass
+
+        return {
+            "status": "ok",
+            "plan": plan,
+            "name": name,
+            "user_id": user_id,
+            "rate_limits": rate_limits,
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
 
 
 # ─── Anthropic billing API ─────────────────────────────────────────────────────

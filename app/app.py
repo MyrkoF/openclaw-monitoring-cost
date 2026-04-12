@@ -237,7 +237,8 @@ with st.sidebar:
 @st.cache_data(ttl=300)
 def load(days):
     from collectors import (collect_openrouter, collect_openai,
-                             collect_anthropic, collect_google)
+                             collect_anthropic, collect_google,
+                             collect_chatgpt_plus)
     return {
         "collected_at": datetime.utcnow().isoformat(),
         "providers": {
@@ -245,7 +246,8 @@ def load(days):
             "openai":     collect_openai(days=days),
             "anthropic":  collect_anthropic(days=days),
             "google":     collect_google(days=days),
-        }
+        },
+        "chatgpt_plus": collect_chatgpt_plus(),
     }
 
 data = load(period_days)
@@ -415,9 +417,14 @@ with tabs[0]:
                 unsafe_allow_html=True,
             )
 
-    # ── OpenAI ─────────────────────────────────────────────────────
+    # ── OpenAI (API + ChatGPT Plus OAuth — merged card) ─────────
     with col_oai:
         d = p.get("openai", {})
+        cgpt = data.get("chatgpt_plus", {})
+
+        # --- API billing section ---
+        api_html = ""
+        oai_badge = ""
         if d.get("status") == "ok":
             usage  = d.get("total_usage_usd_30d", 0) or 0
             org    = d.get("org", "")
@@ -435,22 +442,18 @@ with tabs[0]:
                 usage_period = sum(x["cost_usd"] for x in daily)
             elif usage > 0:
                 usage_period = usage
-                oai_period_label = f"~{period}"  # API total, may not match period
+                oai_period_label = f"~{period}"
             else:
-                # No daily + no total → show nothing rather than misleading 0
                 usage_period = 0
                 oai_period_label = period
 
-            badge_org = (
-                f'<span class="badge" style="margin-left:auto;color:#667eea">{org}</span>'
-                if org else ""
-            )
+            if org:
+                oai_badge = f' <span class="badge" style="margin-left:auto;color:#667eea">{org}</span>'
 
-            # Section crédits prépayés (si disponible, format identique OpenRouter)
             if pre_rem is not None and pre_tot:
                 pre_pct = min((pre_used or 0) / pre_tot * 100, 100) if pre_tot else 0
                 pre_clr = "green" if pre_rem > 5 else ("yellow" if pre_rem > 1 else "red")
-                credits_section = (
+                api_html = (
                     f'<div class="nums-row">'
                     f'<div class="info-block"><div class="big-num {pre_clr}">${pre_rem:.4f}</div><div class="sub-num">remaining credits</div></div>'
                     f'<div class="info-block"><div class="big-num">${pre_used:.4f}</div><div class="sub-num">used (prepaid)</div></div>'
@@ -460,14 +463,13 @@ with tabs[0]:
                     f'<div class="sub-num grey">{pre_pct:.2f}% consumed · ${usage_period:.4f} used ({oai_period_label})</div>'
                 )
             else:
-                credits_section = (
+                api_html = (
                     f'<div class="nums-row">'
                     f'<div class="info-block"><div class="big-num yellow">${usage_period:.4f}</div><div class="sub-num">used ({oai_period_label})</div></div>'
                     f'<div class="info-block"><div class="big-num grey">postpaid</div><div class="sub-num">no prepaid balance</div></div>'
                     f'</div>'
                 )
 
-            # Lignes par modèle avec coût USD estimé
             model_rows = ""
             for m, v in sorted(by_m.items(), key=lambda x: x[1].get("cost_usd", 0), reverse=True):
                 inp   = v.get("input_tokens", 0)
@@ -484,28 +486,49 @@ with tabs[0]:
                     f'<span class="badge badge-green">${cost:.4f}</span>'
                     f'</span></div>'
                 )
-            model_section = (
-                f'<hr class="divider"><div class="sub-num grey" style="margin-bottom:5px">BY MODEL ({oai_period_label}) — estimated cost</div>{model_rows}'
-                if model_rows else '<div class="sub-num grey">No data</div>'
-            )
-
-            st.markdown(
-                f'<div class="card">'
-                f'<div class="card-header">🤖 OpenAI {badge_org}</div>'
-                f'{credits_section}'
-                f'{model_section}'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
-
+            if model_rows:
+                api_html += f'<hr class="divider"><div class="sub-num grey" style="margin-bottom:5px">BY MODEL ({oai_period_label}) — estimated cost</div>{model_rows}'
         else:
-            st.markdown(
-                f'<div class="card">'
-                f'<div class="card-header">🤖 OpenAI</div>'
-                f'<div class="sub-num red">{d.get("error","erreur")}</div>'
-                f'</div>',
-                unsafe_allow_html=True,
+            api_html = f'<div class="sub-num grey">{d.get("error", "API key required (OPENAI_API_KEY)")}</div>'
+
+        # --- ChatGPT Plus section ---
+        cgpt_html = ""
+        if cgpt.get("status") == "ok":
+            plan = cgpt.get("plan", "?").upper()
+            if plan and plan != "UNKNOWN":
+                oai_badge = f' <span class="badge badge-green" style="margin-left:auto">{plan}</span>'
+            rl = cgpt.get("rate_limits", {})
+            rl_rows = ""
+            if rl:
+                req_rem = rl.get("remaining-requests", "?")
+                req_lim = rl.get("limit-requests", "?")
+                tok_rem = rl.get("remaining-tokens", "?")
+                tok_lim = rl.get("limit-tokens", "?")
+                reset_req = rl.get("reset-requests", "")
+                rl_rows = (
+                    f'<div class="model-row"><span>Requests</span>'
+                    f'<span><span class="badge">{req_rem} / {req_lim}</span>'
+                    f'<span class="badge">reset {reset_req}</span></span></div>'
+                    f'<div class="model-row"><span>Tokens</span>'
+                    f'<span><span class="badge">{tok_rem} / {tok_lim}</span></span></div>'
+                )
+            name = cgpt.get("name", "")
+            name_line = f'<div class="sub-num grey" style="margin-top:4px">OAuth · {name}</div>' if name else ""
+            cgpt_html = (
+                f'<hr class="divider">'
+                f'<div class="sub-num grey" style="margin-bottom:4px">ChatGPT Plus — Rate Limits</div>'
+                f'{rl_rows}'
+                f'{name_line}'
             )
+
+        st.markdown(
+            f'<div class="card">'
+            f'<div class="card-header">🤖 OpenAI{oai_badge}</div>'
+            f'{api_html}'
+            f'{cgpt_html}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
 
     st.markdown("<br>", unsafe_allow_html=True)
 

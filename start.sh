@@ -38,11 +38,15 @@ fi
 export OPENCLAW_GATEWAY_TOKEN
 export OPENCLAW_GATEWAY_URL="https://127.0.0.1:18789"
 
-echo "🔑 Clés monitoring chargées depuis OpenClaw :"
+# ChatGPT Plus OAuth token (from OpenClaw .env)
+export CHATGPT_OAUTH_TOKEN="${OPENAI_CODEX_ACCESS_TOKEN:-}"
+
+echo "🔑 Monitoring keys loaded from OpenClaw:"
 echo "   OpenAI Mon    : ${OPENAI_API_KEY_MONITORING:0:20}..."
 echo "   OpenRouter Mon: ${OPENROUTER_API_KEY_MONITORING:0:20}..."
 echo "   Anthropic Mon : ${ANTHROPIC_API_KEY_MONITORING:0:20}..."
 echo "   OpenClaw GW   : ${OPENCLAW_GATEWAY_TOKEN:+configured}${OPENCLAW_GATEWAY_TOKEN:-not set}"
+echo "   ChatGPT OAuth : ${CHATGPT_OAUTH_TOKEN:+configured}${CHATGPT_OAUTH_TOKEN:-not set}"
 
 docker compose up -d "$@"
 

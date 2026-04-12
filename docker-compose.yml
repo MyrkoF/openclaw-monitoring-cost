@@ -28,6 +28,8 @@ services:
       - WEBMIN_URL=${WEBMIN_URL:-https://127.0.0.1:10000/xmlrpc.cgi}
       - WEBMIN_USER=${WEBMIN_USER:-}
       - WEBMIN_PASSWORD=${WEBMIN_PASSWORD:-}
+      # ChatGPT Plus OAuth (optional — account info + rate limits)
+      - CHATGPT_OAUTH_TOKEN=${CHATGPT_OAUTH_TOKEN:-}
       # Anthropic Console billing (optionnel)
       - ANTHROPIC_CONSOLE_API_KEY=${ANTHROPIC_CONSOLE_API_KEY:-}
       - CLAUDE_HOME=/claude-home
