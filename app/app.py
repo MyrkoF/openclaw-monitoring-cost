@@ -1290,45 +1290,68 @@ with tabs[1]:
                             )
 
             with oc_cols[1]:
-                # Security summary
-                sec_status = sec_s.get("status", "?")
-                sec_icon = {"ok": "✅", "warn": "⚠️", "error": "❌"}.get(sec_status, "")
-                summary = sec_s.get("summary", {})
-                crit = summary.get("critical", 0)
-                warn = summary.get("warn", 0)
-                info = summary.get("info", 0)
-                crit_clr = "color:#fc8181" if crit else ""
-                warn_clr = "color:#ecc94b" if warn else ""
+                # Security — classified warnings
+                cl = health.get("security_classified", {})
+                cl_danger = cl.get("danger", [])
+                cl_warning = cl.get("warning", [])
+                cl_silenced = cl.get("silenced", [])
+                cl_cond = cl.get("conditions", {})
 
-                atk = sec_s.get("attack_surface", {})
-                trust_row = ""
-                if atk.get("trust_model"):
-                    short_trust = atk["trust_model"].split(",")[0][:40]
-                    trust_row = f'<div class="sub-num" style="margin-top:4px">🔒 {short_trust}</div>'
+                if cl_danger:
+                    sec_icon = "❌"
+                elif cl_warning:
+                    sec_icon = "⚠️"
+                else:
+                    sec_icon = "✅"
+
+                # Conditions badges
+                cond_badges = ""
+                _cond_labels = {
+                    "gateway_loopback": "loopback",
+                    "matrix_allowlist": "allowlist",
+                    "matrix_single_user": "single user",
+                    "comm_exec_deny": "comm deny",
+                    "web_exec_deny": "web deny",
+                }
+                for ck, label in _cond_labels.items():
+                    ok = cl_cond.get(ck, False)
+                    clr = "badge-green" if ok else ""
+                    style = ' style="color:#fc8181"' if not ok else ""
+                    cond_badges += f'<span class="badge {clr}"{style}>{label} {"✓" if ok else "✗"}</span> '
 
                 st.markdown(
                     f'<div class="card">'
                     f'<div class="card-header">🛡️ Security {sec_icon}</div>'
                     f'<div class="nums-row">'
-                    f'<div class="info-block"><div class="big-num" style="{crit_clr}">{crit}</div><div class="sub-num">critical</div></div>'
-                    f'<div class="info-block"><div class="big-num" style="{warn_clr}">{warn}</div><div class="sub-num">warn</div></div>'
-                    f'<div class="info-block"><div class="big-num">{info}</div><div class="sub-num">info</div></div>'
+                    f'<div class="info-block"><div class="big-num" style="color:#fc8181">{len(cl_danger)}</div><div class="sub-num">danger</div></div>'
+                    f'<div class="info-block"><div class="big-num" style="color:#ecc94b">{len(cl_warning)}</div><div class="sub-num">warning</div></div>'
+                    f'<div class="info-block"><div class="big-num" style="color:#48bb78">{len(cl_silenced)}</div><div class="sub-num">silenced</div></div>'
                     f'</div>'
-                    f'{trust_row}'
+                    f'<div style="margin-top:4px">{cond_badges}</div>'
                     f'</div>',
                     unsafe_allow_html=True,
                 )
 
-                # Warnings detail
-                warnings = sec_s.get("warnings", [])
-                if warnings:
-                    with st.expander(f"Warnings ({len(warnings)})"):
-                        for w in warnings:
-                            msg = w.get("message", "")[:80]
-                            fix = w.get("fix", "")
-                            st.caption(f"⚠ {msg}")
-                            if fix:
-                                st.caption(f"  Fix: {fix[:80]}")
+                # Danger — always visible
+                if cl_danger:
+                    for d_item in cl_danger:
+                        st.error(f"❌ {d_item['message'][:100]}\n→ {d_item['reason']}")
+
+                # Warning — visible
+                if cl_warning:
+                    with st.expander(f"Active warnings ({len(cl_warning)})"):
+                        for w in cl_warning:
+                            st.caption(f"⚠️ {w['message'][:100]}")
+                            st.caption(f"  → {w['reason']}")
+                            if w.get("fix"):
+                                st.caption(f"  Fix: {w['fix'][:80]}")
+
+                # Silenced — closed expander
+                if cl_silenced:
+                    with st.expander(f"Baseline warnings ({len(cl_silenced)})"):
+                        for s in cl_silenced:
+                            st.caption(f"✅ {s['message'][:80]}")
+                            st.caption(f"  → {s['reason']}")
 
             # Raw expanders for debug
             doctor_raw = health.get("doctor", "")
