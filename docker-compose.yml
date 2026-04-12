@@ -44,6 +44,8 @@ services:
       - ${HOME}/.openclaw/agents:/openclaw-sessions:ro
       # Cron runs OpenClaw (Claude API usage) en lecture seule
       - ${HOME}/.openclaw/cron/runs:/openclaw-cron:ro
+      # Cron jobs config (schedule, status) en lecture seule
+      - ${HOME}/.openclaw/cron/jobs.json:/openclaw-cron-jobs.json:ro
       # Opt-in : billing Anthropic via token Claude Code CLI (sensible — décommenter si besoin)
       # - ${HOME}/.claude:/claude-home:ro
       # Opt-in : billing Google Cloud via service account JSON key

@@ -288,10 +288,12 @@ def _openclaw_gateway():
     except Exception:
         pass
 
-    # ── cron (job list + status) ──
+    # ── cron (from jobs.json file — no HTTP tool needed) ──
     try:
-        cl = _gw_invoke(url, token, ctx, "cron", action="list")
-        jobs = cl.get("jobs", [])
+        _cron_path = os.environ.get("OPENCLAW_CRON_JOBS", "/openclaw-cron-jobs.json")
+        with open(_cron_path) as _f:
+            _cron_data = json.load(_f)
+        jobs = _cron_data.get("jobs", [])
         cron_jobs = []
         for j in jobs:
             state = j.get("state", {})
@@ -339,7 +341,7 @@ def _openclaw_gateway():
             if v.get("provider") == "?":
                 v["provider"] = prov_map.get(m, "?")
 
-    if len(result["errors"]) == 4:
+    if len(result["errors"]) == 3:  # sessions, agents, session_status all failed
         return None  # total failure → fallback sidecar
     if result["errors"]:
         result["status"] = "partial"
