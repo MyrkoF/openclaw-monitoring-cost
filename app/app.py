@@ -500,17 +500,22 @@ with tabs[0]:
             rl = cgpt.get("rate_limits", {})
             rl_rows = ""
             if rl:
-                req_rem = rl.get("remaining-requests", "?")
-                req_lim = rl.get("limit-requests", "?")
-                tok_rem = rl.get("remaining-tokens", "?")
-                tok_lim = rl.get("limit-tokens", "?")
+                req_rem = int(rl.get("remaining-requests", 0))
+                req_lim = int(rl.get("limit-requests", 1))
+                tok_rem = int(rl.get("remaining-tokens", 0))
+                tok_lim = int(rl.get("limit-tokens", 1))
                 reset_req = rl.get("reset-requests", "")
+                req_pct = round((req_lim - req_rem) / req_lim * 100, 1) if req_lim else 0
+                tok_pct = round((tok_lim - tok_rem) / tok_lim * 100, 1) if tok_lim else 0
+                _clr = lambda pct: "#48bb78" if pct < 80 else ("#ecc94b" if pct < 95 else "#fc8181")
                 rl_rows = (
                     f'<div class="model-row"><span>Requests</span>'
-                    f'<span><span class="badge">{req_rem} / {req_lim}</span>'
+                    f'<span><span class="badge">{req_rem:,} / {req_lim:,}</span>'
                     f'<span class="badge">reset {reset_req}</span></span></div>'
-                    f'<div class="model-row"><span>Tokens</span>'
-                    f'<span><span class="badge">{tok_rem} / {tok_lim}</span></span></div>'
+                    f'<div class="prog-bar-bg"><div class="prog-bar-fill" style="width:{req_pct}%;background:{_clr(req_pct)}"></div></div>'
+                    f'<div class="model-row" style="margin-top:4px"><span>Tokens</span>'
+                    f'<span><span class="badge">{tok_rem:,} / {tok_lim:,}</span></span></div>'
+                    f'<div class="prog-bar-bg"><div class="prog-bar-fill" style="width:{tok_pct}%;background:{_clr(tok_pct)}"></div></div>'
                 )
             name = cgpt.get("name", "")
             name_line = f'<div class="sub-num grey" style="margin-top:4px">OAuth · {name}</div>' if name else ""
