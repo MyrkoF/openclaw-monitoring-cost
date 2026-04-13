@@ -151,10 +151,10 @@ def collect_webmin():
         return {"status": "error", "error": str(e)}
 
 
-# Global shared state (set by sidebar/init, read by workers — no st.session_state)
+# Global shared state (set by workers, read by UI — no st.session_state)
 _g = {"refresh": 60, "webmin": {}, "gw": {}}
 
-# One-time init: fetch gateway data before any render
+# One-time init: fetch gateway data before first render
 if not _g["gw"]:
     try:
         _init = _openclaw_gateway()
@@ -1373,16 +1373,7 @@ with tabs[1]:
 with tabs[2]:
     st.json(data)
 
-# Auto-refresh: fragment reruns itself every 30s and triggers full rerun
-# only when backend data has actually changed (no unnecessary visual flash)
-_g["_last_ts"] = _g.get("_last_ts", "")
-
-@st.fragment(run_every=timedelta(seconds=30))
-def _auto_refresh():
-    gw_ts = _g["gw"].get("collected_at", "")
-    if gw_ts and gw_ts != _g["_last_ts"]:
-        _g["_last_ts"] = gw_ts
-        st.rerun(scope="app")
-
-_auto_refresh()
+# No auto-refresh — workers update _g in background.
+# Page updates on user interaction (period change, refresh button, tab switch).
+# This avoids infinite rerun loops inherent to Streamlit's execution model.
 
