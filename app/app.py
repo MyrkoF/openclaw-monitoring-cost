@@ -822,24 +822,21 @@ with tabs[1]:
         ufw = _health.get("ufw", {})
         ssh_s = _health.get("ssh_sessions", {})
         if ufw:
-            # Filter out internal/container IPs (Docker, LAN, sandbox)
-            _INTERNAL_PREFIXES = ("172.", "10.", "192.168.", "127.")
-            def _is_external(ip):
-                return not any(ip.startswith(p) for p in _INTERNAL_PREFIXES)
-
-            all_top = ufw.get("top_blocked_ips", [])
-            all_recent = ufw.get("recent_blocks", [])
-            ext_top = [x for x in all_top if _is_external(x.get("ip", ""))][:5]
-            ext_recent = [x for x in all_recent if _is_external(x.get("src", ""))]
+            # Le sidecar a déjà filtré les IPs internes Docker/VPN
+            top_ips = ufw.get("top_blocked_ips", [])[:5]
+            recent_blocks = ufw.get("recent_blocks", [])  # déjà externes uniquement
 
             # External attacks dans la fenêtre period_days
             daily_counts = ufw.get("daily_counts", {})
             attacks_in_period = sum(c for d, c in daily_counts.items() if d >= _period_cutoff)
+            internal_info = ufw.get("internal_blocks_count", 0)
             st.metric(f"External attacks ({period})", attacks_in_period)
+            if internal_info > 0:
+                st.caption(f"ℹ️ {internal_info} internal blocks ignored (Docker/VPN routing)")
 
-            # Top 5 external IPs (with geo if available)
-            if ext_top:
-                df_top = pd.DataFrame(ext_top)
+            # Top 5 external IPs (geo enrichi par le sidecar)
+            if top_ips:
+                df_top = pd.DataFrame(top_ips)
                 col_map = {"ip": "IP", "count": "Blocks"}
                 if "country" in df_top.columns:
                     col_map["country"] = "Country"
@@ -848,12 +845,14 @@ with tabs[1]:
                 df_top = df_top.rename(columns=col_map)
                 show_cols = [c for c in ("IP", "Blocks", "Country", "ISP") if c in df_top.columns]
                 st.dataframe(df_top[show_cols], use_container_width=True, hide_index=True)
+            else:
+                st.caption("No external attacks in this period")
 
-            # Show more — full log in same section
-            if all_recent:
-                with st.expander(f"Full log ({len(all_recent)} entries)"):
+            # Recent external blocks
+            if recent_blocks:
+                with st.expander(f"Recent external blocks ({len(recent_blocks)} entries)"):
                     st.dataframe(
-                        pd.DataFrame(all_recent).rename(columns={
+                        pd.DataFrame(recent_blocks).rename(columns={
                             "time": "Time", "src": "Source", "dst": "Dest",
                             "port": "Port", "proto": "Proto", "iface": "Interface",
                         }),

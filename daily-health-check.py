@@ -765,9 +765,17 @@ def collect_ufw(period_days=30):
     enabled = rc == 0 and "Status: active" in out
     cutoff = datetime.now(timezone.utc) - timedelta(days=period_days)
     log_lines = _read_logs_period("/var/log/ufw.log", days=period_days)
-    blocks = []
-    ip_counts = {}
-    daily_counts = {}  # {date_iso: count}
+
+    # IPs internes (Docker bridges, VPN WireGuard, LAN, loopback) → trafic ignoré pour les compteurs
+    _INTERNAL_PREFIXES = ("172.", "10.", "192.168.", "127.", "169.254.")
+    def _is_internal(ip):
+        return any(ip.startswith(p) for p in _INTERNAL_PREFIXES)
+
+    blocks = []                # tous les blocks (debug only)
+    external_blocks = []       # blocks venant d'IPs externes
+    internal_blocks_count = 0  # compteur info pour trafic interne
+    ip_counts = {}             # uniquement IPs externes
+    daily_counts = {}          # uniquement blocks externes (date_iso → count)
     for l in log_lines:
         if "BLOCK" not in l:
             continue
@@ -779,18 +787,21 @@ def collect_ufw(period_days=30):
         m_dpt = re.search(r'DPT=(\S+)', l)
         m_proto = re.search(r'PROTO=(\S+)', l)
         m_in = re.search(r'IN=(\S+)', l)
-        ts = l.split(" ")[0] if l else ""
         src = m_src.group(1) if m_src else "?"
         entry = {
-            "time":  ts[:19],
+            "time":  ts_dt.isoformat() if ts_dt else "",
             "src":   src,
             "dst":   m_dst.group(1) if m_dst else "?",
             "port":  m_dpt.group(1) if m_dpt else "?",
             "proto": m_proto.group(1) if m_proto else "?",
             "iface": m_in.group(1) if m_in else "?",
-            "ts_iso": ts_dt.isoformat() if ts_dt else "",
         }
         blocks.append(entry)
+        if _is_internal(src):
+            internal_blocks_count += 1
+            continue
+        # Trafic externe uniquement à partir d'ici
+        external_blocks.append(entry)
         ip_counts[src] = ip_counts.get(src, 0) + 1
         if ts_dt:
             day_key = ts_dt.strftime("%Y-%m-%d")
@@ -823,13 +834,15 @@ def collect_ufw(period_days=30):
     auth_out, _, _ = run("sudo tail -100 /var/log/auth.log", timeout=5)
     auth_failures = [l for l in (auth_out or "").splitlines()
                      if "Failed password" in l or "Invalid user" in l]
+    # recent_blocks = derniers 30 blocks EXTERNES (pas le trafic interne Docker/VPN)
     return {
         "enabled": enabled,
-        "denies_period": len(blocks),
+        "denies_period": len(external_blocks),  # uniquement externes
+        "internal_blocks_count": internal_blocks_count,  # info, ignoré dans les compteurs
         "period_days": period_days,
         "daily_counts": daily_counts,
         "top_blocked_ips": top_blocked,
-        "recent_blocks": blocks[-30:],
+        "recent_blocks": external_blocks[-30:],
         "auth_failures": auth_failures[-20:],
     }
 
