@@ -162,11 +162,10 @@ _CLAUDE_MAX_LIMITS = {
 
 def _collect_claude_cli_usage():
     """Collect claude-cli subprocess sessions + estimate hourly rate limit usage."""
-    import glob as _glob
     sessions_dir = os.environ.get("OPENCLAW_SESSIONS_DIR", "/openclaw-sessions")
     now = _time.time()
     hour_ago = now - 3600
-    day_start = now - (now % 86400)  # UTC midnight
+    day_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
 
     cli_sessions = []
     api_sessions = []
@@ -176,8 +175,19 @@ def _collect_claude_cli_usage():
     today_cost = 0.0
     current_model = None
 
-    for sf in _glob.glob(f"{sessions_dir}/*/sessions/sessions.json"):
-        agent = sf.split("/")[-3]
+    # Targeted scandir instead of glob (avoids recursive walk)
+    session_files = []
+    try:
+        for agent_dir in os.scandir(sessions_dir):
+            if not agent_dir.is_dir():
+                continue
+            sdir = os.path.join(agent_dir.path, "sessions")
+            sf = os.path.join(sdir, "sessions.json")
+            if os.path.isfile(sf):
+                session_files.append((agent_dir.name, sf))
+    except OSError:
+        pass
+    for agent, sf in session_files:
         try:
             with open(sf) as f:
                 data = json.load(f)
@@ -210,10 +220,22 @@ def _collect_claude_cli_usage():
                 cli_sessions.append(entry)
                 current_model = model
                 # Count messages from JSONL for rate limit estimation
+                session_id = s.get("sessionId", "")
                 jsonl_path = s.get("sessionFile", "")
-                if not jsonl_path:
-                    jsonl_path = os.path.join(os.path.dirname(sf), f"{s.get('sessionId','')}.jsonl")
-                if os.path.exists(jsonl_path):
+                # Remap host path → container path
+                if jsonl_path and "/agents/" in jsonl_path:
+                    jsonl_path = sessions_dir + "/" + jsonl_path.split("/agents/", 1)[1]
+                # Fallback: scan directory for JSONL matching sessionId (may have -topic-xxx suffix)
+                if not jsonl_path or not os.path.exists(jsonl_path):
+                    sdir = os.path.dirname(sf)
+                    try:
+                        for entry_f in os.scandir(sdir):
+                            if entry_f.name.startswith(session_id) and entry_f.name.endswith('.jsonl'):
+                                jsonl_path = entry_f.path
+                                break
+                    except OSError:
+                        pass
+                if jsonl_path and os.path.exists(jsonl_path):
                     try:
                         with open(jsonl_path) as jf:
                             for line in jf:
@@ -257,10 +279,14 @@ def _collect_claude_cli_usage():
     }
 
 
-# ── OpenClaw version check (GitHub Atom feed) ────────────────────────────────
+# ── OpenClaw version check (GitHub Atom feed, cached 1h) ─────────────────────
+_version_cache = {"ts": 0, "result": None}
 
 def _check_openclaw_latest():
-    """Fetch latest stable OpenClaw release from GitHub Atom feed."""
+    """Fetch latest stable OpenClaw release from GitHub Atom feed (cached 1h)."""
+    now = _time.time()
+    if now - _version_cache["ts"] < 3600 and _version_cache["result"] is not None:
+        return _version_cache["result"]
     import urllib.request, xml.etree.ElementTree as ET
     url = "https://github.com/openclaw/openclaw/releases.atom"
     req = urllib.request.Request(url, headers={"User-Agent": "monitoring-dashboard/1.0"})
@@ -278,7 +304,9 @@ def _check_openclaw_latest():
             continue
         version = tag.lstrip("v")
         release_url = link.get("href", "") if link is not None else ""
-        return {"latest": version, "url": release_url}
+        result = {"latest": version, "url": release_url}
+        _version_cache.update(ts=now, result=result)
+        return result
     return None
 
 
@@ -437,15 +465,22 @@ def _openclaw_gateway():
     # Source 1: sessions.json files (most reliable — has modelProvider field)
     _sessions_dir = os.environ.get("OPENCLAW_SESSIONS_DIR", "/openclaw-sessions")
     try:
-        import glob as _glob
-        for sf in _glob.glob(f"{_sessions_dir}/*/sessions/sessions.json"):
-            with open(sf) as _f:
-                for _sess in json.load(_f).values():
-                    mp = _sess.get("modelProvider", "")
-                    model = _sess.get("model", "")
-                    if mp and model:
-                        prov_map[model] = mp
-    except Exception:
+        for _agent_dir in os.scandir(_sessions_dir):
+            if not _agent_dir.is_dir():
+                continue
+            _sf = os.path.join(_agent_dir.path, "sessions", "sessions.json")
+            if not os.path.isfile(_sf):
+                continue
+            try:
+                with open(_sf) as _f:
+                    for _sess in json.load(_f).values():
+                        mp = _sess.get("modelProvider", "")
+                        model = _sess.get("model", "")
+                        if mp and model:
+                            prov_map[model] = mp
+            except (json.JSONDecodeError, OSError):
+                pass
+    except OSError:
         pass
     # Source 2: cron job payloads (e.g. "openai/gpt-4o-mini")
     for j in result.get("cron", {}).get("jobs", []):
@@ -486,7 +521,8 @@ def _load_sidecar():
 
 # ── Collecte principale ───────────────────────────────────────────────────────
 
-def collect_system():
+def collect_system(gw_override=None):
+    """Collecte principale. Si gw_override est fourni, ne pas re-appeler la gateway."""
     # Métriques depuis /proc (fonctionnent dans tout container Linux)
     uptime, uptime_since = _proc_uptime()
     load      = run("cat /proc/loadavg")
@@ -500,8 +536,8 @@ def collect_system():
     wt_api    = _watchtower_api()
     wt_source = "api" if wt_api is not None else "sidecar"
 
-    # OpenClaw Gateway API — live sessions/agents
-    gw_data   = _openclaw_gateway()
+    # OpenClaw Gateway API — réutiliser si déjà appelé par le worker
+    gw_data   = gw_override if gw_override is not None else _openclaw_gateway()
 
     # ── Données hôte depuis le sidecar (daily-health-check.py) ──────────────
     sidecar = _load_sidecar()
@@ -543,6 +579,7 @@ def collect_system():
     # OpenClaw doctor / security audit — garder les données structurées
     doctor_section = sidecar.get("openclaw_doctor", {})
     audit_section  = sidecar.get("openclaw_security", {})
+    security_classified = sidecar.get("security_classified", {})
     # Raw output pour expander debug
     doctor_raw  = doctor_section.get("output", sidecar.get("doctor", ""))
     audit_raw   = audit_section.get("output",  sidecar.get("security_audit", ""))
@@ -554,6 +591,8 @@ def collect_system():
     github_cli   = sidecar.get("github_cli", {})
     tmux         = sidecar.get("tmux", {})
     claude_code  = sidecar.get("claude_code", {})
+    adguard      = sidecar.get("adguard", {})
+    cron_history = sidecar.get("cron_history", {})
     network      = sidecar.get("network", {})
     fail2ban     = sidecar.get("fail2ban", {})
     ufw          = sidecar.get("ufw", {})
@@ -603,10 +642,13 @@ def collect_system():
         "security_audit":     audit_raw  or "Lancer daily-health-check.py sur le host",
         "doctor_structured":  doctor_section,
         "security_structured": audit_section,
+        "security_classified": security_classified,
         "wireguard":          wireguard,
         "github_cli":         github_cli,
         "tmux":               tmux,
         "claude_code":        claude_code,
+        "adguard":            adguard,
+        "cron_history":       cron_history,
         "network":            network,
         "fail2ban":           fail2ban,
         "ufw":                ufw,
@@ -620,11 +662,22 @@ def collect_system():
         "openclaw_gateway":   gw_data,
     }
 
-    # Écrire le cache
+    # Écrire le cache (écriture atomique)
     try:
-        os.makedirs(os.path.dirname(HEALTH_CACHE), exist_ok=True)
-        with open(HEALTH_CACHE, "w") as f:
-            json.dump(result, f, indent=2)
+        cache_dir = os.path.dirname(HEALTH_CACHE)
+        os.makedirs(cache_dir, exist_ok=True)
+        import tempfile
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=cache_dir, suffix=".tmp")
+        try:
+            with os.fdopen(tmp_fd, "w") as f:
+                json.dump(result, f, indent=2)
+            os.replace(tmp_path, HEALTH_CACHE)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
     except Exception as e:
         result["cache_error"] = str(e)
 

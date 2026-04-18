@@ -8,6 +8,38 @@ Self-hosted Streamlit dashboard for tracking AI provider costs, usage per model,
 
 <!-- Screenshot placeholder -->
 
+## What's new in v2.1
+
+**Stability refactor** — eliminates the OpenClaw freeze/lock issues from v1.x:
+- Sidecar atomic writes, frequency windows (heavy collectors 1×/day, light 30min)
+- Container: process-level singleton thread instead of per-tab → no more gateway flooding when multiple browser tabs open
+- JSONL parsing: single pass with mtime cache instead of recursive glob × providers
+- Removed periodic `openclaw doctor`/`security audit` calls (was the root cause of locks)
+
+**New OpenClaw tab** — dedicated security/observability surface:
+- Interactive warnings table with **Tolerated** checkbox (per-user decision, persisted in `/data/security-decisions.json`)
+- Native severity (`critical` / `warn` / `info`) preserved from OpenClaw audit, counters per level
+- Cron history with success/failed counts over the selected period
+- Doctor structured display, gateway live sessions, Claude subprocess sessions
+
+**Period selector now global** — `1d / 7d / 30d` affects:
+- AI costs (existing)
+- UFW external attacks
+- Fail2ban bans
+- Cron history
+
+**Security enrichments**:
+- UFW: GeoIP for blocked IPs (country + ISP via `ip-api.com` batch, no API key needed)
+- WireGuard: peer summary (active / recent / stale)
+- AdGuard DNS: new card with global stats + blocked queries per VPN client
+- Fail2ban: ban counts over period (parses log rotation `.log.1`, `.log.2.gz`, etc.)
+
+**UX**:
+- Refresh button writes `/data/.refresh-requested` flag → next sidecar run executes the heavy audit
+- Times displayed in server timezone (`TZ` env var, default `America/Cancun`) instead of fixed UTC
+- ChatGPT Plus OAuth section always visible (was hidden when token expired)
+- OpenAI cost: filter API buckets by date (was aggregating lifetime usage as last-30d)
+
 ## Features
 
 ### AI Costs tab
@@ -22,33 +54,41 @@ Self-hosted Streamlit dashboard for tracking AI provider costs, usage per model,
 
 ### System Health tab
 
-- **Live charts** -- CPU, RAM, Network I/O (SQLite-backed, 10s collection)
+- **Live charts** -- CPU, RAM, Network I/O (SQLite-backed, 10s collection, non-blocking psutil)
 - **System** -- uptime, CPU/RAM %, multiple disks, network stats (via `/proc`)
 - **Docker** -- running containers, top-5 CPU stats
-- **Watchtower** -- update sessions with image names
-- **Fail2ban** -- active jails, banned IPs
-- **UFW** -- external attacks only (filters Docker/internal IPs), "Full log" expander
-- **WireGuard** -- interfaces, connected peers, handshakes, traffic
+- **Watchtower** -- update sessions with image names (collected on-demand or 1×/day)
+- **Fail2ban** -- active jails + ban counts over selected period (1d/7d/30d)
+- **UFW** -- external attacks over selected period, GeoIP enrichment (country + ISP), full log expander
+- **WireGuard** -- interfaces, connected peers, handshakes, traffic, peer_summary (active/recent/stale)
+- **AdGuard DNS** -- query stats, block rate, blocked domains per VPN client
 - **Services** -- systemd unit status
 - **DevTools** -- GitHub CLI auth, tmux sessions
 - **APT** -- recent upgrades, upgradable count, auto-upgrade timer
+- **OpenClaw summary card** -- compact version + counters (critical/warn/info/tolerated) + live sessions, links to OpenClaw tab
 
-### OpenClaw card (System Health tab)
+### OpenClaw tab (new in v2.1)
 
-- **Version check** -- installed vs latest stable release via GitHub Atom feed (skips beta/alpha/rc)
-- **Doctor (structured)** -- Matrix status, agents, heartbeat, sessions store, plugin errors
-- **Security (classified)** -- warnings evaluated against actual config conditions, not generic alerts
-  - Protection conditions: `loopback`, `allowlist`, `single user`, `comm deny`, `web deny`
-  - Classified as: danger (always visible), warning (expander), silenced (closed "Baseline warnings")
-- **Cron jobs** -- schedule, last/next run, status, duration (from `jobs.json`, no HTTP tool exposure)
-- **Claude subprocess sessions** -- all agents, provider, model, runtime, tokens
+Dedicated tab for OpenClaw observability and security:
+
+- **Version check** -- installed vs latest stable release via GitHub Atom feed (cached 1h)
+- **Doctor (structured)** -- Matrix/Mattermost status, agents, heartbeat, sessions store, plugin errors
+- **Security counters** -- per native severity from OpenClaw audit:
+  - 🔴 critical / 🟡 warn / 🔵 info / ✅ tolerated
+  - **Tolerated** = warnings the user has reviewed and explicitly accepted (cosmetic, false positives)
+  - Decisions persisted across rebuilds/reboots in `/data/security-decisions.json`
+- **Interactive warnings table** -- single checkbox per warning, default unchecked (= "not yet reviewed = treated as danger")
+- **Gateway live sessions** -- active sessions, total cost/tokens, by channel
+- **Cron jobs** -- jobs config + success/failed counts over period (from JSONL run history)
+- **Claude subprocess sessions** -- per agent: provider, model, runtime, tokens, cost (or "included" for claude-cli)
 
 ### General
 
-- Backend collect interval configurable from 30s to 12h
+- Backend collect interval configurable from 2min to 12h (minimum 2min to avoid gateway flooding)
 - Page updates on user interaction (period change, refresh button, tab switch)
-- Background worker threads for gateway, health, metrics collection
+- **2 background threads total** (was 4 per browser tab in v1.x)
 - Persistent cache -- data displayed even between refreshes
+- Times in server timezone (`TZ` env var)
 
 ## Quick Start
 
@@ -89,6 +129,9 @@ docker compose up -d --build
 | `WEBMIN_URL` | No | Webmin XML-RPC endpoint |
 | `WEBMIN_USER` / `WEBMIN_PASSWORD` | No | Webmin credentials |
 | `GOOGLE_SA_KEY_PATH` | No | GCP service account JSON path inside container |
+| `ADGUARD_URL` | No | AdGuard Home admin URL (default `http://10.8.0.1:3000`) |
+| `ADGUARD_USER` / `ADGUARD_PASSWORD` | No | AdGuard Home admin credentials (for DNS stats card) |
+| `TZ` | No | Container timezone (default falls back to UTC, recommended: `America/Cancun` etc.) |
 
 ### Volumes
 
@@ -109,36 +152,47 @@ The container runs with `network_mode: host`. No port mapping needed -- dashboar
 ## Architecture
 
 ```
-HOST (cron every 10 min)
+HOST (cron every 30 min)
   daily-health-check.py
-    reads  <-- ~/.openclaw/openclaw.json        (config conditions)
-    reads  <-- ~/.openclaw/exec-approvals.json  (exec security)
-    runs   --> openclaw doctor / security audit  (once per 24h, cached)
-    writes --> ./data/host-health.json           (classified warnings + health data)
+    Light collectors (every run):
+      meta, resources, docker, services, wireguard, fail2ban,
+      ufw (with GeoIP), tmux, claude_code, adguard, cron_history
+    Heavy collectors (1×/day OR when /data/.refresh-requested flag exists):
+      openclaw doctor, security audit (with severity parsing),
+      openclaw version, network, github cli, watchtower logs
+    writes --> ./data/host-health.json   (atomic write via tempfile + os.replace)
 
-DOCKER CONTAINER (network_mode: host)
-  app.py (Streamlit on :8888)
-    reads  <-- /data/host-health.json    (sidecar)
-    reads  <-- /proc/*                   (live CPU/RAM/disk)
+DOCKER CONTAINER (bridge network, port :8888)
+  app.py (Streamlit)
+    threads = 2 process-level singletons:
+      live_collector  (10s) — psutil → SQLite (non-blocking)
+      unified_worker  (≥120s, configurable) — gateway + system health + webmin
+    reads  <-- /data/host-health.json   (atomic write from sidecar)
+    reads  <-- /proc/*                  (live CPU/RAM/disk)
     reads  <-- /openclaw-sessions/*/sessions/sessions.json  (provider routing)
     reads  <-- /openclaw-cron-jobs.json  (cron schedules)
-    calls  --> OpenClaw Gateway :18789   (sessions, agents, status)
-    calls  --> Provider APIs             (OpenRouter, OpenAI, Anthropic, Google)
-    stores --> /data/monitoring.db       (SQLite time-series)
+    calls  --> OpenClaw Gateway :18789  (1× per worker cycle, with backoff)
+    calls  --> Provider APIs            (cached 5min: OpenRouter, OpenAI, Anthropic, Google)
+    writes --> /data/security-decisions.json  (user warning tolerance)
+    stores --> /data/metrics.db         (SQLite time-series, persistent connection)
 ```
 
 No Docker socket mounted. All host data flows through the sidecar JSON.
 
+User-action **Refresh button** writes `/data/.refresh-requested` flag → next sidecar run
+(within 30min) executes the heavy audit collectors.
+
 ## Host Sidecar Setup
 
 ```bash
-# Test manually
-python3 daily-health-check.py
+# Source the .env for secrets (AdGuard, etc.) before running
+. /home/myrko/.openclaw/.env
+HEALTH_SIDECAR=/path/to/data/host-health.json python3 daily-health-check.py
 python3 -m json.tool data/host-health.json
 
-# Add to crontab (every 10 minutes)
+# Add to crontab (every 30 minutes is plenty)
 crontab -e
-# */10 * * * * cd ~/monitoring && python3 daily-health-check.py >/dev/null 2>&1
+# */30 * * * * . /home/myrko/.openclaw/.env && HEALTH_SIDECAR=/path/to/data/host-health.json /usr/bin/python3 /path/to/daily-health-check.py >/dev/null 2>&1
 ```
 
 ## Project Structure

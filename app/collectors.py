@@ -74,63 +74,106 @@ def _parse_ts(ts_str):
         return None
 
 
-def _parse_session_files(provider_filter_fn, days=30):
-    """Parse OpenClaw session JSONL files and extract usage entries."""
-    entries = []
-    since = datetime.utcnow() - timedelta(days=days)
-    patterns = [
-        f"{OPENCLAW_SESSIONS_DIR}/**/*.jsonl",
-        f"{OPENCLAW_LOGS_DIR}/**/*.jsonl",
-        f"{OPENCLAW_CRON_DIR}/**/*.jsonl",
-    ]
-    seen_files = set()
-    for pattern in patterns:
-        for lf in glob.glob(pattern, recursive=True):
-            if lf in seen_files:
-                continue
-            seen_files.add(lf)
-            try:
-                with open(lf) as f:
-                    for line in f:
+# ── File cache (mtime-based) — ne re-parser que les fichiers modifiés ─────────
+_file_cache = {}  # {filepath: (mtime, entries)}
+
+
+def _scan_jsonl_files():
+    """List JSONL files via targeted os.scandir (not recursive glob).
+    OpenClaw structure: {dir}/{agent}/sessions/*.jsonl or {dir}/*.jsonl"""
+    files = set()
+    for base_dir in (OPENCLAW_SESSIONS_DIR, OPENCLAW_LOGS_DIR, OPENCLAW_CRON_DIR):
+        if not os.path.isdir(base_dir):
+            continue
+        try:
+            for entry in os.scandir(base_dir):
+                if entry.is_file() and entry.name.endswith('.jsonl'):
+                    files.add(entry.path)
+                elif entry.is_dir():
+                    # Check {agent}/sessions/*.jsonl and {agent}/*.jsonl
+                    for sub in (os.path.join(entry.path, "sessions"), entry.path):
+                        if not os.path.isdir(sub):
+                            continue
                         try:
-                            entry = json.loads(line)
-                            ts = entry.get("timestamp", "")
-                            ts_dt = _parse_ts(ts)
-                            if ts_dt and ts_dt < since:
-                                continue
-                            msg      = entry.get("message", {})
-                            model    = str(msg.get("model") or entry.get("model", ""))
-                            provider = str(msg.get("provider") or entry.get("provider", ""))
-                            if not provider_filter_fn(model, provider):
-                                continue
-                            usage = msg.get("usage") or entry.get("usage") or {}
-                            if not usage:
-                                continue
-                            inp  = (usage.get("input") or usage.get("input_tokens")
-                                    or usage.get("promptTokenCount") or 0)
-                            out  = (usage.get("output") or usage.get("output_tokens")
-                                    or usage.get("candidatesTokenCount") or 0)
-                            cost = (usage.get("cost") or {}).get("total") or 0
-                            if not (inp or out):
-                                continue
-                            entries.append({
-                                "model":         model,
-                                "provider":      provider,
-                                "input_tokens":  int(inp),
-                                "output_tokens": int(out),
-                                "cost_usd":      float(cost),
-                                "timestamp":     ts,
-                            })
-                        except Exception:
+                            for f in os.scandir(sub):
+                                if f.is_file() and f.name.endswith('.jsonl'):
+                                    files.add(f.path)
+                        except OSError:
                             pass
-            except Exception:
-                pass
+        except OSError:
+            pass
+    return files
+
+
+def _parse_single_file(filepath, since):
+    """Parse one JSONL file, return all usage entries."""
+    entries = []
+    try:
+        with open(filepath) as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                    ts = entry.get("timestamp", "")
+                    ts_dt = _parse_ts(ts)
+                    if ts_dt and ts_dt < since:
+                        continue
+                    msg      = entry.get("message", {})
+                    model    = str(msg.get("model") or entry.get("model", ""))
+                    provider = str(msg.get("provider") or entry.get("provider", ""))
+                    usage = msg.get("usage") or entry.get("usage") or {}
+                    if not usage:
+                        continue
+                    inp  = (usage.get("input") or usage.get("input_tokens")
+                            or usage.get("promptTokenCount") or 0)
+                    out  = (usage.get("output") or usage.get("output_tokens")
+                            or usage.get("candidatesTokenCount") or 0)
+                    cost = (usage.get("cost") or {}).get("total") or 0
+                    if not (inp or out):
+                        continue
+                    entries.append({
+                        "model":         model,
+                        "provider":      provider,
+                        "input_tokens":  int(inp),
+                        "output_tokens": int(out),
+                        "cost_usd":      float(cost),
+                        "timestamp":     ts,
+                    })
+                except (json.JSONDecodeError, ValueError):
+                    pass
+    except OSError:
+        pass
     return entries
+
+
+def _parse_all_entries(days=30):
+    """Parse ALL JSONL files once (with mtime cache), return all entries."""
+    since = datetime.utcnow() - timedelta(days=days)
+    all_entries = []
+    for filepath in _scan_jsonl_files():
+        try:
+            mtime = os.path.getmtime(filepath)
+        except OSError:
+            continue
+        cached = _file_cache.get(filepath)
+        if cached and cached[0] == mtime:
+            all_entries.extend(cached[1])
+        else:
+            entries = _parse_single_file(filepath, since)
+            _file_cache[filepath] = (mtime, entries)
+            all_entries.extend(entries)
+    return all_entries
+
+
+def _parse_session_files(provider_filter_fn, days=30, all_entries=None):
+    """Filter pre-parsed entries by provider. Falls back to full parse if needed."""
+    if all_entries is None:
+        all_entries = _parse_all_entries(days)
+    return [e for e in all_entries if provider_filter_fn(e["model"], e["provider"])]
 
 
 # ─── OpenRouter ────────────────────────────────────────────────────────────────
 
-def collect_openrouter(days=30):
+def collect_openrouter(days=30, all_entries=None):
     if not OPENROUTER_API_KEY:
         return {"provider": "openrouter", "status": "no_key", "data": None}
     try:
@@ -147,7 +190,7 @@ def collect_openrouter(days=30):
         # Coût par modèle depuis les logs OpenClaw (provider = openrouter)
         entries = _parse_session_files(
             lambda m, prov: "openrouter" in prov.lower(),
-            days=days,
+            days=days, all_entries=all_entries,
         )
         by_model = {}
         for e in entries:
@@ -195,7 +238,11 @@ def collect_openai(days=30):
         daily    = []
         total    = 0.0
         org_name = ""
+        cutoff   = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
         for bucket in costs_data.get("data", []):
+            bucket_date = bucket.get("start_time_iso", "")[:10]
+            if bucket_date < cutoff:
+                continue  # skip buckets outside requested window
             day_cost = sum(
                 float(res.get("amount", {}).get("value", 0))
                 for res in bucket.get("results", [])
@@ -204,7 +251,7 @@ def collect_openai(days=30):
                 org_name = bucket["results"][0].get("organization_name", "")
             if day_cost > 0:
                 daily.append({
-                    "date":     bucket.get("start_time_iso", "")[:10],
+                    "date":     bucket_date,
                     "cost_usd": round(day_cost, 4),
                 })
                 total += day_cost
@@ -390,10 +437,10 @@ def _collect_anthropic_billing():
 
 # ─── Anthropic (depuis logs OpenClaw) ──────────────────────────────────────────
 
-def collect_anthropic(days=30):
+def collect_anthropic(days=30, all_entries=None):
     entries = _parse_session_files(
         lambda m, prov: ("anthropic" in m or "claude" in m) and "openrouter" not in prov,
-        days=days,
+        days=days, all_entries=all_entries,
     )
 
     by_model = {}
@@ -545,7 +592,7 @@ def _collect_google_billing():
         return {"billing_status": f"error: {str(e)[:80]}"}
 
 
-def collect_google(days=30):
+def collect_google(days=30, all_entries=None):
     """
     Google Gemini — log parsing + Cloud Billing API si service account configuré.
     """
@@ -555,7 +602,7 @@ def collect_google(days=30):
         m = model.lower()
         return "gemini" in m or ("google" in m and "gemini" in m)
 
-    entries = _parse_session_files(is_google_direct, days=days)
+    entries = _parse_session_files(is_google_direct, days=days, all_entries=all_entries)
 
     by_model = {}
     for e in entries:
@@ -594,14 +641,16 @@ def collect_google(days=30):
 
 # ─── Collecte complète ──────────────────────────────────────────────────────────
 
-def collect_all():
+def collect_all(days=30):
+    # Parse tous les JSONL une seule fois (avec cache mtime), puis filtre par provider
+    all_entries = _parse_all_entries(days)
     return {
         "collected_at": datetime.utcnow().isoformat(),
         "providers": {
-            "openrouter": collect_openrouter(),
-            "openai":     collect_openai(),
-            "anthropic":  collect_anthropic(),
-            "google":     collect_google(),
+            "openrouter": collect_openrouter(days=days, all_entries=all_entries),
+            "openai":     collect_openai(days=days),
+            "anthropic":  collect_anthropic(days=days, all_entries=all_entries),
+            "google":     collect_google(days=days, all_entries=all_entries),
         }
     }
 

@@ -6,7 +6,13 @@ Tourne sur le HOST (pas dans le container Docker).
 Écrit ./data/host-health.json (lu par le container via le volume ./data:/data).
 Stdout : rapport markdown pour Matrix/notifications.
 
-Cron : */10 * * * * cd ~/openclaw-monitoring-cost && python3 daily-health-check.py >/dev/null 2>&1
+Cron : */30 * * * * cd ~/openclaw-monitoring-cost && python3 daily-health-check.py >/dev/null 2>&1
+
+Collectes légères (chaque run, 30min) : meta, resources, docker, services,
+wireguard, fail2ban, ufw, ssh, tmux, apt.
+
+Collectes lourdes (1x/jour OU flag /data/.refresh-requested) : openclaw
+doctor/security/version, network, github cli, watchtower logs, classification.
 """
 
 import subprocess
@@ -14,7 +20,7 @@ import json
 import os
 import shlex
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import re
 
@@ -27,15 +33,10 @@ SIDECAR_PATH = Path(os.environ.get(
 
 SERVICES_TO_CHECK = ["docker", "caddy", "nginx", "ssh", "ufw", "fail2ban"]
 
-OPENCLAW_DOCTOR_BASELINE = [
-    "trusted_proxies_missing",
-    "weak_tier",
-    "multi_user_heuristic",
-    "security_full_configured",
-    "tools_reachable_permissive_policy",
-    "sandbox=off",
-    "sandbox off",
-]
+REFRESH_FLAG = Path(os.environ.get(
+    "REFRESH_FLAG",
+    SIDECAR_PATH.parent / ".refresh-requested",
+))
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -293,22 +294,14 @@ def collect_apt():
     }
 
 
-def _filter_baseline(lines):
-    return [
-        l for l in lines
-        if not any(b in l for b in OPENCLAW_DOCTOR_BASELINE)
-    ]
-
-
 def collect_openclaw_version():
-    """Version installée (npm) vs dernière release (blogwatcher)."""
+    """Version installée vs dernière release (blogwatcher).
+    La version installée vient de la gateway API (côté container), pas d'un
+    subprocess openclaw --version qui pourrait bloquer."""
     installed = ""
-    out, _, rc = run("openclaw --version 2>/dev/null", timeout=10)
-    if rc == 0 and out:
-        # "OpenClaw 2026.4.9 (0512059)" → "2026.4.9"
-        m = re.search(r'(\d{4}\.\d+\.\d+)', out)
-        if m:
-            installed = m.group(1)
+    # Version installée récupérée côté container via gateway API
+    # (health_collector.py → _openclaw_gateway → session_status)
+    # On ne lance plus `openclaw --version` ici pour éviter la contention.
 
     latest = ""
     blogwatcher_bin = os.environ.get(
@@ -341,7 +334,7 @@ def collect_openclaw_doctor():
     out, err, code = run("openclaw doctor --yes 2>&1", timeout=60)
     combined = out or err
     lines = [l for l in combined.splitlines() if l.strip()]
-    filtered = _filter_baseline(lines)
+    filtered = lines
 
     has_error = any(
         kw in l.lower() for l in filtered
@@ -361,9 +354,9 @@ def collect_openclaw_doctor():
     # ── Extraction structurée ──
     raw_text = "\n".join(filtered)
 
-    # Matrix status + latence
-    matrix_m = re.search(r'Matrix:\s*(\w+)\s*\((\d+\w+)\)', raw_text)
-    matrix = {"status": matrix_m.group(1), "latency": matrix_m.group(2)} if matrix_m else None
+    # Messaging channel status + latence (Matrix or Mattermost)
+    chan_m = re.search(r'(Matrix|Mattermost):\s*(\w+)(?:\s*\([^)]*\))?\s*\((\d+\w+)\)', raw_text)
+    matrix = {"channel": chan_m.group(1), "status": chan_m.group(2), "latency": chan_m.group(3)} if chan_m else None
 
     # Agents listés
     agents_m = re.search(r'Agents:\s*(.+)', raw_text)
@@ -414,7 +407,7 @@ def collect_openclaw_security():
     out, err, code = run("openclaw security audit 2>&1", timeout=60)
     combined = out or err
     lines = [l for l in combined.splitlines() if l.strip()]
-    filtered = _filter_baseline(lines)
+    filtered = lines
 
     # ── Summary counts ──
     summary_m = re.search(r'(\d+)\s*critical.*?(\d+)\s*warn.*?(\d+)\s*info', "\n".join(filtered))
@@ -424,28 +417,64 @@ def collect_openclaw_security():
         "info":     int(summary_m.group(3)) if summary_m else 0,
     }
 
-    # ── Extract structured warnings ──
+    # ── Extract structured warnings with severity (CRITICAL/WARN/INFO sections) ──
     warnings = []
     current_warn = None
+    current_severity = "warn"  # default if no section header
+    SECTION_HEADERS = {"CRITICAL": "critical", "WARN": "warn", "INFO": "info"}
+    TOPIC_PREFIXES = ("gateway.", "tools.", "summary.", "models.", "plugins.",
+                      "hooks.", "agents.", "skills.", "exec.")
+    # Heuristique : une ligne "key: value" courte (= statut, pas un warning)
+    # Ex : "tools.elevated: enabled", "hooks.webhooks: disabled", "browser control: enabled"
+    _STATUS_LINE_RE = re.compile(r'^[\w.\s]+:\s*\S+(\s+\S+)?\s*$')
+
+    def _is_status_detail(line):
+        """Detecte les lignes 'key: value' qui sont des details, pas des warnings."""
+        if ":" not in line:
+            return False
+        # Doit avoir un format 'key: value' avec value courte (1-2 mots)
+        parts = line.split(":", 1)
+        if len(parts) != 2:
+            return False
+        value = parts[1].strip()
+        # value courte (max 4 mots) = statut, pas un message descriptif
+        return len(value.split()) <= 4 and not value.endswith(".")
+
     for line in filtered:
         stripped = line.strip()
-        if not stripped or stripped in ("WARN", "INFO"):
+        if not stripped:
             continue
-        # Lines starting with a warning topic
-        if stripped.startswith("gateway.") or stripped.startswith("tools.") or stripped.startswith("summary."):
+        # Section header
+        if stripped in SECTION_HEADERS:
             if current_warn:
                 warnings.append(current_warn)
-            current_warn = {"id": stripped.split()[0], "message": stripped, "fix": ""}
-        elif stripped.startswith("Fix:") and current_warn:
-            current_warn["fix"] = stripped[4:].strip()
-        elif stripped.startswith("Full exec trust") or stripped.startswith("Smaller/older") or \
-             stripped.startswith("Runtime/process") or stripped.startswith("Enabled extension") or \
-             stripped.startswith("Permissive tool") or stripped.startswith("Heuristic signals"):
+                current_warn = None
+            current_severity = SECTION_HEADERS[stripped]
+            continue
+        # Topic line (starts a new warning) — sauf si c'est une status line dans INFO
+        is_topic_prefix = any(stripped.startswith(p) for p in TOPIC_PREFIXES)
+        is_status_in_info = (current_severity == "info" and _is_status_detail(stripped))
+
+        if is_topic_prefix and not is_status_in_info:
             if current_warn:
                 warnings.append(current_warn)
-            current_warn = {"id": "", "message": stripped, "fix": ""}
+            parts = stripped.split(" ", 1)
+            wid = parts[0]
+            msg = parts[1] if len(parts) > 1 else stripped
+            current_warn = {
+                "id": wid,
+                "message": msg if msg else stripped,
+                "fix": "",
+                "severity": current_severity,
+            }
         elif stripped.startswith("Fix:") and current_warn:
             current_warn["fix"] = stripped[4:].strip()
+        # Continuation line OR status detail in INFO — append to message
+        elif current_warn and not current_warn.get("fix"):
+            extra = stripped[:200]
+            sep = " · " if is_status_in_info else " "
+            if len(current_warn["message"]) < 400:
+                current_warn["message"] += sep + extra
     if current_warn:
         warnings.append(current_warn)
 
@@ -546,10 +575,17 @@ def collect_wireguard():
             "peers":           d["peers"],
         })
 
+    # Peer summary par catégorie
+    all_peers = [p for i in iface_list for p in i["peers"]]
+    active = sum(1 for p in all_peers if p["connected"])                      # < 5min
+    recent = sum(1 for p in all_peers if not p["connected"] and p["handshake"] not in ("never", "stale"))
+    stale  = sum(1 for p in all_peers if p["handshake"] in ("never", "stale"))
+
     return {
         "interfaces":      iface_list,
         "total_peers":     sum(i["peers_total"]     for i in iface_list),
         "connected_peers": sum(i["peers_connected"] for i in iface_list),
+        "peer_summary":    {"active": active, "recent": recent, "stale": stale},
         "status":          "ok" if iface_list else "unavailable",
     }
 
@@ -635,10 +671,10 @@ def collect_tmux():
     return {"sessions": sessions, "count": len(sessions), "status": "ok"}
 
 
-def collect_fail2ban():
+def collect_fail2ban(period_days=30):
     _, _, rc = run("sudo fail2ban-client ping", timeout=5)
     if rc != 0:
-        return {"status": "unavailable", "jails": {}}
+        return {"status": "unavailable", "jails": {}, "bans_period": 0, "period_days": period_days}
     jails = {}
     for jail in ["sshd", "nginx-http-auth", "caddy"]:
         out, _, rc2 = run(f"sudo fail2ban-client status {jail}", timeout=10)
@@ -651,17 +687,92 @@ def collect_fail2ban():
             "total_banned": int(m_total.group(1)) if m_total else 0,
             "active": "Currently failed" in out,
         }
-    return {"status": "active" if jails else "inactive", "jails": jails}
+
+    # Parse fail2ban.log over the period for ban/unban counts
+    cutoff = datetime.now(timezone.utc) - timedelta(days=period_days)
+    log_lines = _read_logs_period("/var/log/fail2ban.log", days=period_days)
+    bans_period = 0
+    unbans_period = 0
+    daily_bans = {}
+    for l in log_lines:
+        ts_dt = _parse_syslog_ts(l)
+        if ts_dt and ts_dt < cutoff:
+            continue
+        if "[NOTICE]" in l and "Ban " in l and "Unban" not in l:
+            bans_period += 1
+            if ts_dt:
+                day_key = ts_dt.strftime("%Y-%m-%d")
+                daily_bans[day_key] = daily_bans.get(day_key, 0) + 1
+        elif "[NOTICE]" in l and "Unban " in l:
+            unbans_period += 1
+
+    return {
+        "status": "active" if jails else "inactive",
+        "jails": jails,
+        "bans_period": bans_period,
+        "unbans_period": unbans_period,
+        "daily_bans": daily_bans,
+        "period_days": period_days,
+    }
 
 
-def collect_ufw():
+def _read_logs_period(base_path, days=30):
+    """Read all log lines from base_path + rotated copies (.1, .2.gz...) for the period.
+    Returns a list of (timestamp_iso, line) tuples sorted by timestamp ascending."""
+    import gzip
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    files = []
+    # Newest first: base, .1, .2.gz, .3.gz...
+    for suffix in ("", ".1", ".2.gz", ".3.gz", ".4.gz"):
+        p = base_path + suffix
+        if os.path.exists(p):
+            files.append(p)
+    lines = []
+    for p in files:
+        opener = gzip.open if p.endswith(".gz") else open
+        try:
+            cmd = f"sudo cat {p}" if not p.endswith(".gz") else f"sudo zcat {p}"
+            data, _, _ = run(cmd, timeout=10)
+            for ln in (data or "").splitlines():
+                lines.append(ln)
+        except Exception:
+            pass
+    return lines
+
+
+def _parse_syslog_ts(line, year=None):
+    """Parse syslog timestamp 'Apr 18 09:30:01' or ISO '2026-04-18T09:30:01' to datetime UTC."""
+    # Try ISO format first
+    m = re.match(r'^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})', line)
+    if m:
+        try:
+            return datetime.fromisoformat(m.group(1)).replace(tzinfo=timezone.utc)
+        except: pass
+    # Syslog format: "Apr 18 09:30:01"
+    m = re.match(r'^(\w{3})\s+(\d+)\s+(\d{2}):(\d{2}):(\d{2})', line)
+    if m:
+        try:
+            mon, day, h, mn, s = m.groups()
+            mons = {"Jan":1,"Feb":2,"Mar":3,"Apr":4,"May":5,"Jun":6,"Jul":7,"Aug":8,"Sep":9,"Oct":10,"Nov":11,"Dec":12}
+            year = year or datetime.now(timezone.utc).year
+            return datetime(year, mons.get(mon, 1), int(day), int(h), int(mn), int(s), tzinfo=timezone.utc)
+        except: pass
+    return None
+
+
+def collect_ufw(period_days=30):
     out, _, rc = run("sudo ufw status verbose", timeout=10)
     enabled = rc == 0 and "Status: active" in out
-    log_out, _, _ = run("sudo tail -500 /var/log/ufw.log", timeout=5)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=period_days)
+    log_lines = _read_logs_period("/var/log/ufw.log", days=period_days)
     blocks = []
     ip_counts = {}
-    for l in (log_out or "").splitlines():
+    daily_counts = {}  # {date_iso: count}
+    for l in log_lines:
         if "BLOCK" not in l:
+            continue
+        ts_dt = _parse_syslog_ts(l)
+        if ts_dt and ts_dt < cutoff:
             continue
         m_src = re.search(r'SRC=(\S+)', l)
         m_dst = re.search(r'DST=(\S+)', l)
@@ -677,20 +788,159 @@ def collect_ufw():
             "port":  m_dpt.group(1) if m_dpt else "?",
             "proto": m_proto.group(1) if m_proto else "?",
             "iface": m_in.group(1) if m_in else "?",
+            "ts_iso": ts_dt.isoformat() if ts_dt else "",
         }
         blocks.append(entry)
         ip_counts[src] = ip_counts.get(src, 0) + 1
+        if ts_dt:
+            day_key = ts_dt.strftime("%Y-%m-%d")
+            daily_counts[day_key] = daily_counts.get(day_key, 0) + 1
     top_ips = sorted(ip_counts.items(), key=lambda x: -x[1])[:10]
+
+    # Géolocalisation des top IPs bloquées (ip-api.com batch, gratuit, pas de clé)
+    top_blocked = [{"ip": ip, "count": c} for ip, c in top_ips]
+    if top_blocked:
+        try:
+            import urllib.request
+            ips_to_lookup = [e["ip"] for e in top_blocked if e["ip"] != "?"]
+            if ips_to_lookup:
+                req = urllib.request.Request(
+                    "http://ip-api.com/batch?fields=query,country,countryCode,isp,org",
+                    data=json.dumps(ips_to_lookup).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    geo_data = json.loads(resp.read().decode())
+                geo_map = {g["query"]: g for g in geo_data if isinstance(g, dict) and "query" in g}
+                for entry in top_blocked:
+                    g = geo_map.get(entry["ip"], {})
+                    entry["country"] = g.get("countryCode", "")
+                    entry["isp"] = g.get("isp", "")
+        except Exception:
+            pass
+
     auth_out, _, _ = run("sudo tail -100 /var/log/auth.log", timeout=5)
     auth_failures = [l for l in (auth_out or "").splitlines()
                      if "Failed password" in l or "Invalid user" in l]
     return {
         "enabled": enabled,
-        "denies_hour": len(blocks),
-        "top_blocked_ips": [{"ip": ip, "count": c} for ip, c in top_ips],
+        "denies_period": len(blocks),
+        "period_days": period_days,
+        "daily_counts": daily_counts,
+        "top_blocked_ips": top_blocked,
         "recent_blocks": blocks[-30:],
         "auth_failures": auth_failures[-20:],
     }
+
+
+def collect_cron_history(period_days=30):
+    """Parse OpenClaw cron run JSONL files to count success/failed per job over period."""
+    runs_dir = Path.home() / ".openclaw" / "cron" / "runs"
+    if not runs_dir.is_dir():
+        return {"jobs": {}, "period_days": period_days, "total_ok": 0, "total_error": 0}
+
+    cutoff_ms = int((datetime.now(timezone.utc) - timedelta(days=period_days)).timestamp() * 1000)
+    jobs = {}  # {job_id: {"ok": N, "error": N, "skip": N, "last_run_ms": ts, "last_status": str}}
+
+    for f in runs_dir.glob("*.jsonl"):
+        try:
+            with open(f) as fh:
+                for line in fh:
+                    try:
+                        d = json.loads(line)
+                        ts = d.get("ts", 0) or d.get("runAtMs", 0)
+                        if ts < cutoff_ms:
+                            continue
+                        if d.get("action") != "finished":
+                            continue
+                        jid = d.get("jobId", "")
+                        if not jid:
+                            continue
+                        status = d.get("status", "unknown")
+                        if jid not in jobs:
+                            jobs[jid] = {"ok": 0, "error": 0, "skip": 0, "other": 0,
+                                         "last_run_ms": 0, "last_status": ""}
+                        if status == "ok":
+                            jobs[jid]["ok"] += 1
+                        elif status in ("error", "failed"):
+                            jobs[jid]["error"] += 1
+                        elif status == "skip":
+                            jobs[jid]["skip"] += 1
+                        else:
+                            jobs[jid]["other"] += 1
+                        if ts > jobs[jid]["last_run_ms"]:
+                            jobs[jid]["last_run_ms"] = ts
+                            jobs[jid]["last_status"] = status
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+        except OSError:
+            continue
+
+    total_ok    = sum(j["ok"]    for j in jobs.values())
+    total_error = sum(j["error"] for j in jobs.values())
+    total_skip  = sum(j["skip"]  for j in jobs.values())
+    return {
+        "jobs": jobs,
+        "period_days": period_days,
+        "total_ok": total_ok,
+        "total_error": total_error,
+        "total_skip": total_skip,
+    }
+
+
+def collect_adguard():
+    """Collect AdGuard Home stats + blocked queries for VPN clients."""
+    url  = os.environ.get("ADGUARD_URL", "http://10.8.0.1:3000")
+    user = os.environ.get("ADGUARD_USER", "")
+    pwd  = os.environ.get("ADGUARD_PASSWORD", "")
+    if not user or not pwd:
+        return {"status": "not_configured"}
+    try:
+        import urllib.request, base64
+        auth = base64.b64encode(f"{user}:{pwd}".encode()).decode()
+        headers = {"Authorization": f"Basic {auth}"}
+
+        # Stats globales
+        req_stats = urllib.request.Request(
+            f"{url}/control/stats", headers=headers
+        )
+        with urllib.request.urlopen(req_stats, timeout=5) as resp:
+            stats = json.loads(resp.read().decode())
+
+        # Requêtes bloquées récentes
+        req_log = urllib.request.Request(
+            f"{url}/control/querylog?limit=200&response_status=blocked",
+            headers=headers,
+        )
+        with urllib.request.urlopen(req_log, timeout=5) as resp:
+            log_data = json.loads(resp.read().decode())
+
+        # Filtrer par clients VPN (10.8.0.x)
+        blocked_vpn = []
+        for entry in log_data.get("data", []):
+            client = entry.get("client", "")
+            if client.startswith("10.8.0.") or client.startswith("10.0.0."):
+                blocked_vpn.append({
+                    "client":  client,
+                    "domain":  entry.get("question", {}).get("name", "?"),
+                    "reason":  entry.get("reason", ""),
+                    "time":    entry.get("time", "")[:19],
+                })
+            if len(blocked_vpn) >= 50:
+                break
+
+        return {
+            "status":              "ok",
+            "dns_queries":         stats.get("num_dns_queries", 0),
+            "blocked_filtering":   stats.get("num_blocked_filtering", 0),
+            "blocked_pct":         round(stats.get("num_blocked_filtering", 0) /
+                                        max(stats.get("num_dns_queries", 1), 1) * 100, 1),
+            "avg_processing_time": stats.get("avg_processing_time", 0),
+            "blocked_vpn_clients": blocked_vpn,
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)[:200]}
 
 
 def collect_ssh_sessions():
@@ -910,61 +1160,95 @@ def _classify_security_warnings(doctor, security):
 
 # ── Assemblage ─────────────────────────────────────────────────────────────────
 
-def _reuse_openclaw_from_sidecar():
-    """Reuse openclaw doctor/security results if less than 24h old."""
+def _need_audit():
+    """Check if heavy audit should run: flag file OR > 24h since last audit."""
+    if REFRESH_FLAG.exists():
+        return True
     try:
         data = json.loads(SIDECAR_PATH.read_text(encoding="utf-8"))
-        ts = data.get("meta", {}).get("collected_at", "")
-        if not ts:
-            return None, None
-        age = (datetime.now(timezone.utc) - datetime.fromisoformat(ts)).total_seconds()
-        if age < 86400:  # 24h — doctor/security run once per day
-            return data.get("openclaw_doctor"), data.get("openclaw_security")
+        audit_at = data.get("meta", {}).get("audit_at", "")
+        if not audit_at:
+            return True  # never run
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(audit_at)).total_seconds()
+        return age >= 86400  # > 24h
     except Exception:
-        pass
-    return None, None
+        return True  # can't read → run
+
+
+def _reuse_from_sidecar(*keys):
+    """Reuse fields from previous sidecar JSON (for skipped heavy collections)."""
+    try:
+        data = json.loads(SIDECAR_PATH.read_text(encoding="utf-8"))
+        return {k: data.get(k) for k in keys}
+    except Exception:
+        return {k: None for k in keys}
 
 
 def build_report():
-    meta      = collect_meta()
-    resources = collect_resources()
-    network   = collect_network()
-    docker    = collect_docker()
-    watchtower = collect_watchtower()
-    apt       = collect_apt()
-    services  = collect_services(docker_data=docker)
-    wireguard  = collect_wireguard()
-    github_cli = collect_github_auth()
-    tmux       = collect_tmux()
-    claude_code = collect_claude_code()
-    fail2ban     = collect_fail2ban()
-    ufw          = collect_ufw()
+    # ── Collectes légères (chaque run, 30min) ─────────────────────────────────
+    meta         = collect_meta()
+    resources    = collect_resources()
+    docker       = collect_docker()
+    apt          = collect_apt()
+    services     = collect_services(docker_data=docker)
+    wireguard    = collect_wireguard()
+    tmux         = collect_tmux()
+    claude_code  = collect_claude_code()
+    adguard      = collect_adguard()
+    fail2ban     = collect_fail2ban(period_days=30)
+    ufw          = collect_ufw(period_days=30)
+    cron_history = collect_cron_history(period_days=30)
     ssh_sessions = collect_ssh_sessions()
 
-    openclaw_version = collect_openclaw_version()
+    # ── Collectes lourdes (1x/jour OU bouton refresh) ─────────────────────────
+    run_audit = _need_audit()
 
-    # OpenClaw checks: reuse if < 24h old (doctor/security run once/day)
-    cached_doc, cached_sec = _reuse_openclaw_from_sidecar()
-    doctor   = cached_doc  or collect_openclaw_doctor()
-    security = cached_sec  or collect_openclaw_security()
+    if run_audit:
+        network          = collect_network()
+        watchtower       = collect_watchtower()
+        github_cli       = collect_github_auth()
+        openclaw_version = collect_openclaw_version()
+        doctor           = collect_openclaw_doctor()
+        security         = collect_openclaw_security()
+        classified       = _classify_security_warnings(doctor, security)
+        meta["audit_at"] = datetime.now(timezone.utc).isoformat()
+        # Consume flag
+        try:
+            REFRESH_FLAG.unlink(missing_ok=True)
+        except Exception:
+            pass
+    else:
+        # Reuse previous audit results
+        cached = _reuse_from_sidecar(
+            "network", "watchtower", "github_cli", "openclaw_version",
+            "openclaw_doctor", "openclaw_security", "security_classified",
+        )
+        network          = cached["network"] or {}
+        watchtower       = cached["watchtower"] or {"raw_last50": [], "updates": [], "errors": [], "image_updates": []}
+        github_cli       = cached["github_cli"] or {}
+        openclaw_version = cached["openclaw_version"] or {}
+        doctor           = cached["openclaw_doctor"] or {"output": ["Audit pas encore exécuté"], "status": "ok", "exit_code": 0}
+        security         = cached["openclaw_security"] or {"output": ["Audit pas encore exécuté"], "issues": [], "status": "ok", "exit_code": 0}
+        classified       = cached["security_classified"] or {}
+        # Preserve audit timestamp from previous run
+        try:
+            prev = json.loads(SIDECAR_PATH.read_text(encoding="utf-8"))
+            meta["audit_at"] = prev.get("meta", {}).get("audit_at", "")
+        except Exception:
+            pass
 
-    # Classify security warnings against actual config
-    classified = _classify_security_warnings(doctor, security)
-
-    # Calcul du statut global — use classified status instead of raw
+    # Calcul du statut global
     if classified.get("danger"):
         security["status"] = "error"
     elif classified.get("warning"):
         security["status"] = "warn"
-    elif not classified.get("danger") and not classified.get("warning"):
-        security["status"] = "ok"
 
     global_status = _calc_status(
-        doctor["status"],
-        security["status"],
-        wireguard["status"],
+        doctor.get("status", "ok"),
+        security.get("status", "ok"),
+        wireguard.get("status", "ok"),
         "warn" if watchtower.get("errors") else "ok",
-        "warn" if apt["upgradable_count"] > 10 else "ok",
+        "warn" if apt.get("upgradable_count", 0) > 10 else "ok",
     )
     meta["global_status"] = global_status
 
@@ -984,8 +1268,10 @@ def build_report():
         "github_cli":        github_cli,
         "tmux":              tmux,
         "claude_code":       claude_code,
+        "adguard":           adguard,
         "fail2ban":          fail2ban,
         "ufw":               ufw,
+        "cron_history":      cron_history,
         "ssh_sessions":      ssh_sessions,
     }
 
@@ -1060,12 +1346,22 @@ if __name__ == "__main__":
     # Stdout markdown (Matrix / notification)
     print(format_markdown(data))
 
-    # JSON sidecar pour le dashboard
+    # JSON sidecar pour le dashboard (écriture atomique)
     try:
         SIDECAR_PATH.parent.mkdir(parents=True, exist_ok=True)
-        SIDECAR_PATH.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False),
-            encoding="utf-8",
+        import tempfile
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=str(SIDECAR_PATH.parent), suffix=".tmp"
         )
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, str(SIDECAR_PATH))
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
     except Exception as e:
         print(f"[WARN] Impossible d'écrire le sidecar JSON : {e}", flush=True)

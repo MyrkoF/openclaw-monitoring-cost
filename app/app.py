@@ -90,9 +90,14 @@ h1 { font-size: 1.3rem !important; margin-bottom: 0.1rem !important; }
 # ── Live metrics collector (10s → SQLite) ─────────────────────────────────────
 def live_collector():
     _prev_net = None
+    _cycle = 0
+    _db_conn = None
+    # Premier appel non-bloquant: init baseline CPU
+    psutil.cpu_percent(interval=0)
+    time.sleep(1)
     while True:
         try:
-            cpu = psutil.cpu_percent(interval=1)
+            cpu = psutil.cpu_percent(interval=0)  # non-bloquant (delta depuis dernier appel)
             mem = psutil.virtual_memory().percent
             net = psutil.net_io_counters()
             net_in = net_out = 0.0
@@ -102,20 +107,32 @@ def live_collector():
             _prev_net = net
             wg_peers = 0
             try:
-                s = json.loads(open("/data/host-health.json").read())
+                with open("/data/host-health.json") as f:
+                    s = json.load(f)
                 wg_peers = s.get("wireguard", {}).get("connected_peers", 0)
-            except Exception:
+            except (json.JSONDecodeError, OSError):
                 pass
-            conn = sqlite3.connect(METRICS_DB)
-            conn.execute(
+            # Connexion SQLite persistante
+            if _db_conn is None:
+                _db_conn = sqlite3.connect(METRICS_DB)
+            _db_conn.execute(
                 "INSERT INTO metrics VALUES (?,?,?,?,?,?)",
                 (datetime.utcnow().isoformat(), cpu, mem, net_in, net_out, wg_peers)
             )
-            conn.execute("DELETE FROM metrics WHERE ts < datetime('now','-2 hours')")
-            conn.commit()
-            conn.close()
+            # Purge vieilles métriques tous les 10 cycles (~90s) au lieu de chaque cycle
+            _cycle += 1
+            if _cycle >= 10:
+                _db_conn.execute("DELETE FROM metrics WHERE ts < datetime('now','-2 hours')")
+                _cycle = 0
+            _db_conn.commit()
         except Exception:
-            pass
+            # Reset connexion en cas d'erreur
+            try:
+                if _db_conn:
+                    _db_conn.close()
+            except Exception:
+                pass
+            _db_conn = None
         time.sleep(9)
 
 
@@ -152,67 +169,58 @@ def collect_webmin():
 
 
 # Global shared state (set by workers, read by UI — no st.session_state)
-_g = {"refresh": 60, "webmin": {}, "gw": {}}
+_g = {"refresh": 120, "webmin": {}, "gw": {}}
 
-# One-time init: fetch gateway data before first render
-if not _g["gw"]:
-    try:
-        _init = _openclaw_gateway()
-        if _init:
-            _g["gw"] = _init
-    except Exception:
-        pass
 
-def _webmin_worker():
+# ── Unified background worker (remplace 3 workers séparés) ──────────────────
+# Un seul thread pour gateway + health + webmin.  Élimine les appels gateway
+# en double et le bombardement de l'API OpenClaw.
+def _unified_worker():
+    _backoff = 0
     while True:
+        interval = max(_g["refresh"], 120)
+        # Gateway — une seule fois, résultat partagé
+        gw = None
+        try:
+            gw = _openclaw_gateway()
+            if gw is not None:
+                _g["gw"] = gw
+                _backoff = 0
+        except Exception:
+            _backoff = min(_backoff + 1, 5)
+        # System health — passe gw pour éviter re-appel
+        try:
+            collect_system(gw_override=gw)
+        except Exception:
+            pass
+        # Webmin
         try:
             _g["webmin"] = collect_webmin()
         except Exception:
             pass
-        time.sleep(max(_g["refresh"], 30))
+        time.sleep(interval + _backoff * 60)
 
 
-def _openclaw_gw_worker():
-    while True:
-        try:
-            result = _openclaw_gateway()
-            if result is not None:
-                _g["gw"] = result
-        except Exception:
-            pass
-        time.sleep(max(_g["refresh"], 30))
+# ── Process-level singleton (pas st.session_state = pas de multiplication) ──
+_thread_lock = threading.Lock()
+_threads_started = False
 
+def _start_workers_once():
+    global _threads_started
+    with _thread_lock:
+        if _threads_started:
+            return
+        _threads_started = True
+        threading.Thread(target=_unified_worker, daemon=True).start()
+        threading.Thread(target=live_collector, daemon=True).start()
+        # Bootstrap: si pas de cache, collecter une fois synchrone
+        if not os.path.exists(HEALTH_CACHE):
+            try:
+                collect_system()
+            except Exception:
+                pass
 
-# ── Background health refresh ────────────────────────────────────────────────
-def _health_worker():
-    while True:
-        try:
-            collect_system()
-        except Exception:
-            pass
-        time.sleep(max(_g["refresh"], 30))
-
-if "health_thread_started" not in st.session_state:
-    t = threading.Thread(target=_health_worker, daemon=True)
-    t.start()
-    st.session_state["health_thread_started"] = True
-    if not os.path.exists(HEALTH_CACHE):
-        try:
-            collect_system()
-        except Exception:
-            pass
-
-if "live_collector_started" not in st.session_state:
-    threading.Thread(target=live_collector, daemon=True).start()
-    st.session_state["live_collector_started"] = True
-
-if "webmin_thread_started" not in st.session_state:
-    threading.Thread(target=_webmin_worker, daemon=True).start()
-    st.session_state["webmin_thread_started"] = True
-
-if "openclaw_gw_thread_started" not in st.session_state:
-    threading.Thread(target=_openclaw_gw_worker, daemon=True).start()
-    st.session_state["openclaw_gw_thread_started"] = True
+_start_workers_once()
 
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
@@ -220,17 +228,22 @@ with st.sidebar:
     st.markdown("**⚙️ Controls**")
     period = st.radio("Period", ["1d", "7d", "30d"], index=2, horizontal=True)
     period_days = {"1d": 1, "7d": 7, "30d": 30}[period]
-    _backend_opts = [30, 60, 300, 1800, 3600, 43200]
-    _backend_labels = {30: "30s", 60: "1min", 300: "5min", 1800: "30min", 3600: "1h", 43200: "12h"}
+    _backend_opts = [120, 300, 1800, 3600, 43200]
+    _backend_labels = {120: "2min", 300: "5min", 1800: "30min", 3600: "1h", 43200: "12h"}
     backend_interval = st.selectbox("Backend interval", _backend_opts,
-                                     format_func=lambda x: _backend_labels[x], index=1)
+                                     format_func=lambda x: _backend_labels[x], index=0)
     _g["refresh"] = backend_interval
     alerts_enabled = st.checkbox("🔔 Alerts CPU>80% / Disk<20%")
 
     if st.button("🔄 Refresh", use_container_width=True):
+        # Demander au sidecar host de relancer les collectes lourdes
+        try:
+            open("/data/.refresh-requested", "w").close()
+        except Exception:
+            pass
         st.cache_data.clear()
         st.rerun()
-    st.caption(f"UTC {datetime.utcnow().strftime('%H:%M:%S')}")
+    st.caption(f"{datetime.now().strftime('%H:%M:%S %Z')}")
 
 
 # ── Data ───────────────────────────────────────────────────────────────────────
@@ -238,14 +251,16 @@ with st.sidebar:
 def load(days):
     from collectors import (collect_openrouter, collect_openai,
                              collect_anthropic, collect_google,
-                             collect_chatgpt_plus)
+                             collect_chatgpt_plus, _parse_all_entries)
+    # Parse tous les JSONL une seule fois (cache mtime), filtrage par provider ensuite
+    all_entries = _parse_all_entries(days)
     return {
         "collected_at": datetime.utcnow().isoformat(),
         "providers": {
-            "openrouter": collect_openrouter(days=days),
+            "openrouter": collect_openrouter(days=days, all_entries=all_entries),
             "openai":     collect_openai(days=days),
-            "anthropic":  collect_anthropic(days=days),
-            "google":     collect_google(days=days),
+            "anthropic":  collect_anthropic(days=days, all_entries=all_entries),
+            "google":     collect_google(days=days, all_entries=all_entries),
         },
         "chatgpt_plus": collect_chatgpt_plus(),
     }
@@ -282,9 +297,9 @@ def load_metrics(n=60):
 
 # ── Header ─────────────────────────────────────────────────────────────────────
 st.markdown("# 📊 AI Cost Monitor")
-st.caption(f"Local VPS · period: **{period}** · {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC")
+st.caption(f"Local VPS · period: **{period}** · {datetime.now().strftime('%Y-%m-%d %H:%M %Z')}")
 
-tabs = st.tabs(["💰 AI Costs", "🖥️ System Health", "🗂 Raw"])
+tabs = st.tabs(["💰 AI Costs", "🖥️ System Health", "🛡️ OpenClaw", "🗂 Raw"])
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -500,9 +515,9 @@ with tabs[0]:
 
         # --- ChatGPT Plus section ---
         cgpt_html = ""
-        if cgpt.get("status") == "ok":
-            plan = cgpt.get("plan", "?").upper()
-            if plan and plan != "UNKNOWN":
+        if cgpt.get("status") == "ok" or cgpt.get("status") == "no_token":
+            plan = cgpt.get("plan", "?").upper() if cgpt.get("status") == "ok" else ""
+            if plan and plan != "UNKNOWN" and plan != "?":
                 oai_badge = f' <span class="badge badge-green" style="margin-left:auto">{plan}</span>'
             rl = cgpt.get("rate_limits", {})
             rl_rows = ""
@@ -526,6 +541,8 @@ with tabs[0]:
                 )
             name = cgpt.get("name", "")
             name_line = f'<div class="sub-num grey" style="margin-top:4px">OAuth · {name}</div>' if name else ""
+            if not rl_rows:
+                rl_rows = '<div class="sub-num grey">Rate limits: no data (token expired or not configured)</div>'
             cgpt_html = (
                 f'<hr class="divider">'
                 f'<div class="sub-num grey" style="margin-bottom:4px">ChatGPT Plus — Rate Limits</div>'
@@ -775,9 +792,13 @@ with tabs[1]:
             st.dataframe(df_stats, use_container_width=True, hide_index=True)
 
     # ── ROW C — Sécurité (Fail2ban | UFW/SSH) ───────────────────────────────
+    # Période active filtre les compteurs (utilise daily_counts/daily_bans du sidecar)
+    from datetime import datetime as _dt, timedelta as _td
+    _period_cutoff = (_dt.utcnow() - _td(days=period_days)).strftime("%Y-%m-%d")
+
     cs1, cs2 = st.columns(2)
     with cs1:
-        st.markdown("#### 🛡️ Fail2ban")
+        st.markdown(f"#### 🛡️ Fail2ban ({period})")
         fb = _health.get("fail2ban", {})
         if fb.get("status") == "unavailable":
             st.warning("Fail2ban not accessible (check sudoers on host)")
@@ -785,15 +806,19 @@ with tabs[1]:
             st.error("Fail2ban INACTIVE")
             st.warning("Sur le host : `sudo systemctl start fail2ban`")
         elif fb.get("status") == "active":
+            # Compter les bans dans la fenêtre period_days
+            daily_bans = fb.get("daily_bans", {})
+            bans_in_period = sum(c for d, c in daily_bans.items() if d >= _period_cutoff)
+            st.metric(f"Bans ({period})", bans_in_period)
             st.success("Fail2ban active")
             for jail, info in fb.get("jails", {}).items():
                 banned = info.get("banned", 0)
                 color = "#fc8181" if banned > 0 else "#48bb78"
-                st.markdown(f'<span style="color:{color}">● {jail}: {banned} banned</span>', unsafe_allow_html=True)
+                st.markdown(f'<span style="color:{color}">● {jail}: {banned} currently banned</span>', unsafe_allow_html=True)
         else:
             st.caption("No data — run daily-health-check.py")
     with cs2:
-        st.markdown("#### 🔥 UFW / SSH")
+        st.markdown(f"#### 🔥 UFW / SSH ({period})")
         ufw = _health.get("ufw", {})
         ssh_s = _health.get("ssh_sessions", {})
         if ufw:
@@ -806,16 +831,23 @@ with tabs[1]:
             all_recent = ufw.get("recent_blocks", [])
             ext_top = [x for x in all_top if _is_external(x.get("ip", ""))][:5]
             ext_recent = [x for x in all_recent if _is_external(x.get("src", ""))]
-            ext_denies = sum(x.get("count", 0) for x in ext_top)
 
-            st.metric("External attacks/h", ext_denies)
+            # External attacks dans la fenêtre period_days
+            daily_counts = ufw.get("daily_counts", {})
+            attacks_in_period = sum(c for d, c in daily_counts.items() if d >= _period_cutoff)
+            st.metric(f"External attacks ({period})", attacks_in_period)
 
-            # Top 5 external IPs
+            # Top 5 external IPs (with geo if available)
             if ext_top:
-                st.dataframe(
-                    pd.DataFrame(ext_top).rename(columns={"ip": "IP", "count": "Blocks"}),
-                    use_container_width=True, hide_index=True,
-                )
+                df_top = pd.DataFrame(ext_top)
+                col_map = {"ip": "IP", "count": "Blocks"}
+                if "country" in df_top.columns:
+                    col_map["country"] = "Country"
+                if "isp" in df_top.columns:
+                    col_map["isp"] = "ISP"
+                df_top = df_top.rename(columns=col_map)
+                show_cols = [c for c in ("IP", "Blocks", "Country", "ISP") if c in df_top.columns]
+                st.dataframe(df_top[show_cols], use_container_width=True, hide_index=True)
 
             # Show more — full log in same section
             if all_recent:
@@ -837,6 +869,27 @@ with tabs[1]:
             st.dataframe(pd.DataFrame(sessions), use_container_width=True, hide_index=True)
         else:
             st.caption("No active SSH sessions")
+
+    # ── ROW C.bis — AdGuard DNS ──────────────────────────────────────────────
+    ag = _health.get("adguard", {})
+    if ag.get("status") == "ok":
+        st.markdown("#### 🛡️ AdGuard DNS")
+        ag_cols = st.columns(3)
+        ag_cols[0].metric("DNS Queries", f"{ag.get('dns_queries', 0):,}")
+        ag_cols[1].metric("Blocked", f"{ag.get('blocked_filtering', 0):,}")
+        ag_cols[2].metric("Block Rate", f"{ag.get('blocked_pct', 0)}%")
+        vpn_blocks = ag.get("blocked_vpn_clients", [])
+        if vpn_blocks:
+            with st.expander(f"Blocked for VPN clients ({len(vpn_blocks)} entries)"):
+                df_ag = pd.DataFrame(vpn_blocks)
+                col_map = {"client": "Client", "domain": "Domain", "reason": "Reason", "time": "Time"}
+                df_ag = df_ag.rename(columns=col_map)
+                show = [c for c in ("Time", "Client", "Domain", "Reason") if c in df_ag.columns]
+                st.dataframe(df_ag[show], use_container_width=True, hide_index=True)
+        else:
+            st.caption("No blocked queries from VPN clients")
+    elif ag.get("status") == "not_configured":
+        pass  # silencieux si pas configuré
 
     # ── ROW D — Webmin Live ──────────────────────────────────────────────────
     wm = _g["webmin"]
@@ -1137,240 +1190,354 @@ with tabs[1]:
                     unsafe_allow_html=True,
                 )
 
-        # ── OpenClaw card — structured doctor/security + version + gateway live ─
+        # ── OpenClaw — résumé compact (détails dans onglet "🛡️ OpenClaw") ──
         oc_ver = health.get("openclaw_version", {})
         doc_s  = health.get("doctor_structured", {})
         sec_s  = health.get("security_structured", {})
         gw     = _g["gw"] or health.get("openclaw_gateway")
 
         if oc_ver or doc_s or sec_s or gw:
-            st.markdown("#### 🦞 OpenClaw")
-            oc_cols = st.columns(2)
-
-            with oc_cols[0]:
-                # Version
-                installed = oc_ver.get("installed", "?")
-                latest    = oc_ver.get("latest", "?")
-                up2date   = oc_ver.get("up_to_date")
-                if up2date is True:
-                    ver_badge = f'<span class="badge badge-green">{installed}</span>'
-                elif up2date is False:
-                    ver_badge = f'<span class="badge" style="color:#fc8181">{installed} → {latest}</span>'
-                else:
-                    ver_badge = f'<span class="badge">{installed}</span>'
-
-                # Doctor
-                doc_status = doc_s.get("status", "?")
-                doc_icon = {"ok": "✅", "warn": "⚠️", "error": "❌"}.get(doc_status, "")
-                matrix = doc_s.get("matrix")
-                matrix_row = (
-                    f'<div class="model-row"><span>Matrix</span>'
-                    f'<span class="badge badge-green">{matrix["status"]} ({matrix["latency"]})</span></div>'
-                ) if matrix else ""
-                # Agents — prefer gateway count (live) over doctor (sidecar)
-                gw_agents = gw.get("agents", {}) if gw else {}
-                doc_agents = doc_s.get("agents", [])
-                agents_count = gw_agents.get("count") or len(doc_agents)
-                agents_row = (
-                    f'<div class="model-row"><span>Agents</span>'
-                    f'<span class="badge">{agents_count}</span></div>'
-                ) if agents_count else ""
-                hb = doc_s.get("heartbeat")
-                hb_row = (
-                    f'<div class="model-row"><span>Heartbeat</span>'
-                    f'<span class="badge">{hb["interval"]} ({hb["agent"]})</span></div>'
-                ) if hb else ""
-                sess_count = doc_s.get("sessions_count")
-                sess_row = (
-                    f'<div class="model-row"><span>Sessions store</span>'
-                    f'<span class="badge">{sess_count} entries</span></div>'
-                ) if sess_count is not None else ""
-                mem_status = doc_s.get("memory_status")
-                mem_row = (
-                    f'<div class="model-row"><span>Memory plugin</span>'
-                    f'<span class="badge" style="color:#ecc94b">inactive</span></div>'
-                ) if mem_status == "inactive" else ""
-                # Plugin errors (only if > 0)
-                pe = doc_s.get("plugin_errors", 0)
-                pe_row = (
-                    f'<div class="model-row"><span>Plugin errors</span>'
-                    f'<span class="badge" style="color:#fc8181">{pe}</span></div>'
-                ) if pe else ""
-                # Skills blocked
-                sb = doc_s.get("skills_blocked", 0)
-                sb_row = (
-                    f'<div class="model-row"><span>Skills blocked</span>'
-                    f'<span class="badge" style="color:#fc8181">{sb}</span></div>'
-                ) if sb else ""
-                # Compat warnings
-                compat = doc_s.get("compat_warnings", [])
-                compat_rows = "".join(
-                    f'<div class="sub-num" style="color:#ecc94b;margin-top:2px">'
-                    f'⚠ {c["plugin"]}: legacy {c["hook"]}</div>'
-                    for c in compat
-                )
-
-                # Gateway live rows (sessions, cost, tokens)
-                gw_rows = ""
-                gw_badge = ""
-                if gw and gw.get("sessions"):
-                    gs = gw["sessions"]
-                    gw_badge = ' <span class="badge badge-green" style="font-size:10px!important">LIVE</span>'
-                    gw_rows = (
-                        f'<div class="model-row"><span>Live Sessions</span>'
-                        f'<span class="badge badge-green">{gs["count"]}</span></div>'
-                        f'<div class="model-row"><span>Total Cost</span>'
-                        f'<span class="badge">${gs["total_cost_usd"]:.4f}</span></div>'
-                        f'<div class="model-row"><span>Total Tokens</span>'
-                        f'<span class="badge">{gs["total_tokens"]:,}</span></div>'
-                    )
-                    # By channel breakdown
-                    for ch, cnt in gs.get("by_channel", {}).items():
-                        gw_rows += (
-                            f'<div class="model-row"><span>&nbsp;&nbsp;{ch}</span>'
-                            f'<span class="badge">{cnt}</span></div>'
-                        )
-
-                st.markdown(
-                    f'<div class="card">'
-                    f'<div class="card-header">🦞 OpenClaw {ver_badge} {doc_icon}{gw_badge}</div>'
-                    f'{matrix_row}{agents_row}{hb_row}{sess_row}{gw_rows}{mem_row}{pe_row}{sb_row}{compat_rows}'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-
-                # Live sessions detail (gateway)
-                if gw and gw.get("sessions", {}).get("active"):
-                    active_sessions = gw["sessions"]["active"]
-                    with st.expander(f"Live Sessions ({len(active_sessions)})"):
-                        for s in active_sessions:
-                            name = s["name"]
-                            if len(name) > 40:
-                                name = name[:37] + "..."
-                            st.caption(
-                                f"  {name} · {s['model']} · {s['channel']} · "
-                                f"{s['tokens']:,} tok · ${s['cost_usd']:.4f} · {s['status']} · {s['updated']}"
-                            )
-
-                # Cron jobs detail (gateway)
-                if gw and gw.get("cron", {}).get("jobs"):
-                    cron_jobs = gw["cron"]["jobs"]
-                    all_ok = all(j["last_status"] == "ok" and j["consecutive_errors"] == 0 for j in cron_jobs)
-                    cron_icon = "✅" if all_ok else "⚠️"
-                    with st.expander(f"Cron Jobs ({len(cron_jobs)}) {cron_icon}"):
-                        for j in cron_jobs:
-                            status_icon = "✅" if j["last_status"] == "ok" else "❌"
-                            err_note = f" · {j['consecutive_errors']} errors" if j["consecutive_errors"] else ""
-                            st.caption(
-                                f"  {status_icon} {j['name']} · {j['schedule']} ({j['tz']}) · "
-                                f"{j['model']} · {j['last_duration_s']}s{err_note} · next: {j['next_run']}"
-                            )
-
-                # Session activity (sidecar doctor)
-                activity = doc_s.get("session_activity", [])
-                if activity:
-                    with st.expander(f"Recent sessions ({len(activity)})"):
-                        for a in activity:
-                            short_name = a["name"].replace("agent:main:", "")
-                            st.caption(f"  {short_name} — {a['ago']}")
-
-                # Claude-cli subprocess sessions (all agents)
-                _cli = (gw.get("claude_cli", {}) if gw else {})
-                _all_cli = _cli.get("cli_sessions", []) + _cli.get("api_sessions", [])
-                if _all_cli:
-                    with st.expander(f"Claude subprocess sessions ({len(_all_cli)})"):
-                        for s in _all_cli:
-                            from datetime import datetime as _dt, timezone as _tz
-                            ts = _dt.fromtimestamp(s["started_at_ms"] / 1000, tz=_tz.utc).strftime("%m-%d %H:%M") if s["started_at_ms"] else "?"
-                            prov_label = "cli" if s["provider"] == "claude-cli" else "api"
-                            cost_label = "included" if s["provider"] == "claude-cli" and s["cost_usd"] == 0 else f"${s['cost_usd']:.4f}"
-                            st.caption(
-                                f"  {s['agent']}:{s['session_id']} · {prov_label} · {s['model']} · "
-                                f"{s['status']} · {s['runtime_s']}s · {s['tokens']:,} tok · {cost_label} · {ts}"
-                            )
-
-            with oc_cols[1]:
-                # Security — classified warnings
-                cl = health.get("security_classified", {})
-                cl_danger = cl.get("danger", [])
-                cl_warning = cl.get("warning", [])
-                cl_silenced = cl.get("silenced", [])
-                cl_cond = cl.get("conditions", {})
-
-                if cl_danger:
-                    sec_icon = "❌"
-                elif cl_warning:
-                    sec_icon = "⚠️"
-                else:
-                    sec_icon = "✅"
-
-                # Conditions badges
-                cond_badges = ""
-                _cond_labels = {
-                    "gateway_loopback": "loopback",
-                    "matrix_allowlist": "allowlist",
-                    "matrix_single_user": "single user",
-                    "comm_exec_deny": "comm deny",
-                    "web_exec_deny": "web deny",
-                }
-                for ck, label in _cond_labels.items():
-                    ok = cl_cond.get(ck, False)
-                    clr = "badge-green" if ok else ""
-                    style = ' style="color:#fc8181"' if not ok else ""
-                    cond_badges += f'<span class="badge {clr}"{style}>{label} {"✓" if ok else "✗"}</span> '
-
-                st.markdown(
-                    f'<div class="card">'
-                    f'<div class="card-header">🛡️ Security {sec_icon}</div>'
-                    f'<div class="nums-row">'
-                    f'<div class="info-block"><div class="big-num" style="color:#fc8181">{len(cl_danger)}</div><div class="sub-num">danger</div></div>'
-                    f'<div class="info-block"><div class="big-num" style="color:#ecc94b">{len(cl_warning)}</div><div class="sub-num">warning</div></div>'
-                    f'<div class="info-block"><div class="big-num" style="color:#48bb78">{len(cl_silenced)}</div><div class="sub-num">silenced</div></div>'
-                    f'</div>'
-                    f'<div style="margin-top:4px">{cond_badges}</div>'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-
-                # Danger — always visible
-                if cl_danger:
-                    for d_item in cl_danger:
-                        st.error(f"❌ {d_item['message'][:100]}\n→ {d_item['reason']}")
-
-                # Warning — visible
-                if cl_warning:
-                    with st.expander(f"Active warnings ({len(cl_warning)})"):
-                        for w in cl_warning:
-                            st.caption(f"⚠️ {w['message'][:100]}")
-                            st.caption(f"  → {w['reason']}")
-                            if w.get("fix"):
-                                st.caption(f"  Fix: {w['fix'][:80]}")
-
-                # Silenced — closed expander
-                if cl_silenced:
-                    with st.expander(f"Baseline warnings ({len(cl_silenced)})"):
-                        for s in cl_silenced:
-                            st.caption(f"✅ {s['message'][:80]}")
-                            st.caption(f"  → {s['reason']}")
-
-            # Raw expanders for debug
-            doctor_raw = health.get("doctor", "")
-            audit_raw  = health.get("security_audit", "")
-            if doctor_raw and "daily-health-check" not in doctor_raw:
-                with st.expander("Raw output — Doctor"):
-                    st.code(doctor_raw, language=None)
-            if audit_raw and "daily-health-check" not in audit_raw:
-                with st.expander("Raw output — Security Audit"):
-                    st.code(audit_raw, language=None)
+            from dismissed_warnings import load_decisions, warning_key
+            sec_section = health.get("security_structured", {}) or {}
+            doc_section = health.get("doctor_structured", {}) or {}
+            _all_warns = sec_section.get("warnings", []) + [
+                {"message": f"{c.get('plugin','?')} legacy {c.get('hook','?')}",
+                 "severity": "info", "fix": "", "id": "doctor.compat"}
+                for c in doc_section.get("compat_warnings", [])
+            ]
+            _decisions = load_decisions()
+            # Par niveau d'origine OpenClaw, exclure les tolérés
+            _crit, _warn, _info, _toler = 0, 0, 0, 0
+            for w in _all_warns:
+                key = warning_key(w.get("message", ""))
+                dec = _decisions.get(key)
+                is_tolerated = bool(dec) and dec.get("is_tolerated", not dec.get("is_danger", True))
+                if is_tolerated:
+                    _toler += 1
+                    continue
+                sev = w.get("severity", "warn")
+                if sev == "critical": _crit += 1
+                elif sev == "info":   _info += 1
+                else:                 _warn += 1
+            sec_icon = "❌" if _crit > 0 else ("⚠️" if _warn > 0 else "✅")
+            installed = oc_ver.get("installed", "?")
+            latest = oc_ver.get("latest", "")
+            up2date = oc_ver.get("up_to_date")
+            ver_badge = f'<span class="badge badge-green">{installed}</span>' if up2date is True else (
+                f'<span class="badge" style="color:#fc8181">{installed} → {latest}</span>' if up2date is False else
+                f'<span class="badge">{installed}</span>'
+            )
+            gw_badge = ' <span class="badge badge-green" style="font-size:10px!important">LIVE</span>' if (gw and gw.get("sessions")) else ''
+            live_sess = (gw or {}).get("sessions", {}).get("count", 0) if gw else 0
+            st.markdown(
+                f'<div class="card">'
+                f'<div class="card-header">🦞 OpenClaw {ver_badge} {sec_icon}{gw_badge}</div>'
+                f'<div class="nums-row">'
+                f'<div class="info-block"><div class="big-num" style="color:#fc8181">{_crit}</div><div class="sub-num">critical</div></div>'
+                f'<div class="info-block"><div class="big-num" style="color:#ecc94b">{_warn}</div><div class="sub-num">warn</div></div>'
+                f'<div class="info-block"><div class="big-num" style="color:#63b3ed">{_info}</div><div class="sub-num">info</div></div>'
+                f'<div class="info-block"><div class="big-num" style="color:#48bb78">{_toler}</div><div class="sub-num">toléré</div></div>'
+                f'</div>'
+                f'<div class="sub-num grey" style="margin-top:6px">→ Détails dans l\'onglet 🛡️ OpenClaw</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
     else:
         st.info("System collection in progress, refreshing shortly…")
 
 
 # ══════════════════════════════════════════════════════════════════
-# TAB 3 — Raw
+# TAB 3 — OpenClaw
 # ══════════════════════════════════════════════════════════════════
 with tabs[2]:
+    health = _health
+    if not health:
+        st.info("System collection in progress, refreshing shortly…")
+    else:
+        from dismissed_warnings import load_decisions, save_decision, warning_key
+
+        oc_ver = health.get("openclaw_version", {})
+        doc_s  = health.get("doctor_structured", {})
+        gw     = _g["gw"] or health.get("openclaw_gateway") or {}
+        cl     = health.get("security_classified", {})
+
+        # ── Header version ─────────────────────────────────────────────
+        installed = oc_ver.get("installed", "?")
+        latest    = oc_ver.get("latest", "")
+        up2date   = oc_ver.get("up_to_date")
+        ver_text = f"v{installed}" if installed != "?" else "version unknown"
+        if up2date is True:
+            st.success(f"🦞 OpenClaw **{ver_text}** — up to date")
+        elif up2date is False:
+            st.warning(f"🦞 OpenClaw **{ver_text}** — update available: {latest}")
+        else:
+            st.info(f"🦞 OpenClaw **{ver_text}**")
+
+        oc_c1, oc_c2 = st.columns(2)
+
+        # ── Doctor structuré ──────────────────────────────────────────
+        with oc_c1:
+            st.markdown("#### 🩺 Doctor")
+            doc_status = doc_s.get("status", "?")
+            doc_icon = {"ok": "✅", "warn": "⚠️", "error": "❌"}.get(doc_status, "")
+            st.markdown(f"**Status: {doc_icon} {doc_status}**")
+            doc_rows = []
+            matrix = doc_s.get("matrix")
+            if matrix:
+                doc_rows.append(f"**{matrix.get('channel', 'Channel')}**: {matrix['status']} ({matrix['latency']})")
+            agents = (gw.get("agents", {}) or {}).get("count") or len(doc_s.get("agents", []))
+            if agents:
+                doc_rows.append(f"**Agents**: {agents}")
+            hb = doc_s.get("heartbeat")
+            if hb:
+                doc_rows.append(f"**Heartbeat**: {hb['interval']} ({hb['agent']})")
+            sc = doc_s.get("sessions_count")
+            if sc is not None:
+                doc_rows.append(f"**Sessions store**: {sc} entries")
+            mem_status = doc_s.get("memory_status")
+            if mem_status == "inactive":
+                doc_rows.append(f"⚠️ **Memory plugin**: inactive")
+            pe = doc_s.get("plugin_errors", 0)
+            if pe:
+                doc_rows.append(f"❌ **Plugin errors**: {pe}")
+            sb = doc_s.get("skills_blocked", 0)
+            if sb:
+                doc_rows.append(f"❌ **Skills blocked**: {sb}")
+            for r in doc_rows:
+                st.markdown(f"- {r}")
+
+        # ── Security conditions + compteurs (basés sur décisions user) ──
+        with oc_c2:
+            st.markdown("#### 🛡️ Security")
+            cl_cond = cl.get("conditions", {})
+            cond_labels = {
+                "gateway_loopback": "loopback",
+                "matrix_allowlist": "allowlist",
+                "matrix_single_user": "single user",
+                "comm_exec_deny": "comm deny",
+                "web_exec_deny": "web deny",
+            }
+            badges = []
+            for ck, label in cond_labels.items():
+                ok = cl_cond.get(ck, False)
+                badges.append(f"{'✅' if ok else '❌'} {label}")
+            st.caption(" · ".join(badges))
+
+            # Niveaux d'origine OpenClaw, exclusion des tolérés
+            sec_section = health.get("security_structured", {}) or {}
+            doc_section = health.get("doctor_structured", {}) or {}
+            all_warns = sec_section.get("warnings", []) + [
+                {"message": f"{c.get('plugin','?')} legacy {c.get('hook','?')}",
+                 "severity": "info", "fix": "", "id": "doctor.compat"}
+                for c in doc_section.get("compat_warnings", [])
+            ]
+            decisions = load_decisions()
+            crit_c, warn_c, info_c, toler_c = 0, 0, 0, 0
+            for w in all_warns:
+                key = warning_key(w.get("message", ""))
+                dec = decisions.get(key)
+                is_tolerated = bool(dec) and dec.get("is_tolerated", not dec.get("is_danger", True))
+                if is_tolerated:
+                    toler_c += 1
+                    continue
+                sev = w.get("severity", "warn")
+                if sev == "critical": crit_c += 1
+                elif sev == "info":   info_c += 1
+                else:                 warn_c += 1
+
+            sc1, sc2, sc3, sc4 = st.columns(4)
+            sc1.metric("🔴 Critical", crit_c)
+            sc2.metric("🟡 Warn", warn_c)
+            sc3.metric("🔵 Info", info_c)
+            sc4.metric("✅ Toléré", toler_c)
+
+        # ── Tableau interactif des warnings ────────────────────────────
+        st.markdown("---")
+        st.markdown("### 📋 Classification des warnings")
+
+        with st.expander("ℹ️ Comment ça marche", expanded=False):
+            st.markdown("""
+**Niveaux d'origine OpenClaw** (préservés tels quels) :
+- 🔴 **critical** : vrai problème sécurité
+- 🟡 **warn** : attention, à examiner
+- 🔵 **info** : pour information
+
+**Tes checkboxes "Toléré"** servent uniquement à **filtrer** ce que tu as relu et accepté
+(cosmétique, faux positif, lié à ta config). Elles ne changent jamais le niveau d'origine d'un warning.
+
+**Logique des compteurs des cards** :
+```
+critical_displayed = critical_total − (critical tolérés par toi)
+warn_displayed     = warn_total     − (warn tolérés par toi)
+info_displayed     = info_total     − (info tolérés par toi)
+```
+
+**Persistence** : tes décisions sont enregistrées dans `/data/security-decisions.json`
+(volume Docker monté côté host : `/mnt/data/docker/volumes/tools/monitoring/data/`).
+Elles **survivent** au redémarrage du container, au rebuild, et au reboot du serveur.
+            """)
+
+        if not all_warns:
+            st.success("Aucun warning à classifier.")
+        else:
+            # Tri: critical d'abord, puis warn, puis info
+            sev_order = {"critical": 0, "warn": 1, "info": 2}
+            sorted_warns = sorted(all_warns, key=lambda w: sev_order.get(w.get("severity", "warn"), 1))
+
+            # Header row
+            hcols = st.columns([1.2, 4.5, 1.2, 0.8])
+            hcols[0].markdown("**Niveau**")
+            hcols[1].markdown("**Warning**")
+            hcols[2].markdown("**☑️ Toléré ?**")
+            hcols[3].markdown("**Final**")
+            st.markdown('<hr style="margin:2px 0">', unsafe_allow_html=True)
+
+            sev_badges = {
+                "critical": ("🔴", "critical", "#fc8181"),
+                "warn":     ("🟡", "warn",     "#ecc94b"),
+                "info":     ("🔵", "info",     "#63b3ed"),
+            }
+
+            for idx, w in enumerate(sorted_warns):
+                msg = w.get("message", "")
+                key = warning_key(msg)
+                sev = w.get("severity", "warn")
+                badge_emoji, badge_label, badge_color = sev_badges.get(sev, ("⚪", sev, "#a0aec0"))
+
+                # Décision actuelle : par défaut DÉCOCHÉ (= garde son niveau natif)
+                dec = decisions.get(key)
+                user_decided = dec is not None
+                if user_decided:
+                    is_tolerated = dec.get("is_tolerated", not dec.get("is_danger", True))
+                else:
+                    is_tolerated = False
+
+                cols = st.columns([1.2, 4.5, 1.2, 0.8])
+                with cols[0]:
+                    st.markdown(
+                        f'<div style="color:{badge_color};font-weight:600">{badge_emoji} {badge_label}</div>',
+                        unsafe_allow_html=True,
+                    )
+                with cols[1]:
+                    short = msg[:140] + "…" if len(msg) > 140 else msg
+                    st.markdown(f"`{short}`")
+                    if w.get("fix"):
+                        st.caption(f"💡 Fix: {w['fix'][:140]}")
+                    if user_decided:
+                        from datetime import datetime as _dt
+                        try:
+                            ts = _dt.fromisoformat(dec["updated_at"]).strftime("%Y-%m-%d %H:%M")
+                            st.caption(f"📌 Décision: {ts}")
+                        except Exception:
+                            st.caption("📌 Décidé")
+                    else:
+                        st.caption("⏳ Pas encore relu")
+                with cols[2]:
+                    new_val = st.checkbox(
+                        "tolere",
+                        value=is_tolerated,
+                        key=f"warn_{idx}_{key}",
+                        help="Coche si tu as relu ce warning et tu l'acceptes (cosmétique, lié à ta config). Sauvegardé automatiquement.",
+                        label_visibility="collapsed",
+                    )
+                    if new_val != is_tolerated:
+                        save_decision(key, is_danger=not new_val, message_preview=msg)
+                        st.rerun()
+                with cols[3]:
+                    if new_val:
+                        st.markdown("## ✅")
+                    else:
+                        st.markdown(f'<div style="font-size:1.6rem">{badge_emoji}</div>', unsafe_allow_html=True)
+
+        # ── Gateway live sessions ──────────────────────────────────────
+        st.markdown("---")
+        st.markdown("### 🔴 Gateway Live Sessions")
+        gs = gw.get("sessions", {})
+        if gs and gs.get("active"):
+            gs_cols = st.columns(3)
+            gs_cols[0].metric("Active sessions", gs.get("count", 0))
+            gs_cols[1].metric("Total tokens", f"{gs.get('total_tokens', 0):,}")
+            gs_cols[2].metric("Total cost", f"${gs.get('total_cost_usd', 0):.4f}")
+            df_sess = pd.DataFrame([
+                {
+                    "Name": (s["name"][:40] + "…") if len(s["name"]) > 40 else s["name"],
+                    "Model": s["model"], "Channel": s["channel"],
+                    "Tokens": s["tokens"], "Cost $": s["cost_usd"],
+                    "Status": s["status"], "Updated": s["updated"],
+                }
+                for s in gs["active"]
+            ])
+            st.dataframe(df_sess, use_container_width=True, hide_index=True)
+        else:
+            st.caption("No active sessions")
+
+        # ── Cron jobs (avec history sur la periode) ────────────────────
+        st.markdown("---")
+        st.markdown(f"### ⏰ Cron Jobs ({period} window)")
+        cron_jobs = (gw.get("cron", {}) or {}).get("jobs", [])
+        cron_hist = health.get("cron_history", {}).get("jobs", {})
+        if cron_jobs:
+            ch_total_ok = health.get("cron_history", {}).get("total_ok", 0)
+            ch_total_err = health.get("cron_history", {}).get("total_error", 0)
+            ccc1, ccc2, ccc3 = st.columns(3)
+            ccc1.metric("✅ Success runs", ch_total_ok)
+            ccc2.metric("❌ Failed runs", ch_total_err)
+            ccc3.metric("Configured jobs", len(cron_jobs))
+            df_cron = []
+            for j in cron_jobs:
+                jid = next((k for k in cron_hist if k.startswith(j["name"][:8])), None)
+                hist = cron_hist.get(jid, {}) if jid else {}
+                df_cron.append({
+                    "Name": j["name"],
+                    "Enabled": "✅" if j.get("enabled") else "❌",
+                    "Schedule": j.get("schedule", "?"),
+                    "Model": j.get("model", "?"),
+                    f"OK ({period})": hist.get("ok", 0),
+                    f"Err ({period})": hist.get("error", 0),
+                    "Last": j.get("last_status", "?"),
+                    "Next run": j.get("next_run", "?"),
+                })
+            st.dataframe(pd.DataFrame(df_cron), use_container_width=True, hide_index=True)
+        else:
+            st.caption("No cron jobs configured")
+
+        # ── Claude subprocess sessions ─────────────────────────────────
+        cli_data = (gw.get("claude_cli", {}) or {})
+        all_cli = cli_data.get("cli_sessions", []) + cli_data.get("api_sessions", [])
+        if all_cli:
+            st.markdown("---")
+            st.markdown(f"### 🧠 Claude Subprocess Sessions ({len(all_cli)})")
+            df_cli = []
+            for s in all_cli:
+                from datetime import datetime as _dt, timezone as _tz
+                ts = _dt.fromtimestamp(s["started_at_ms"] / 1000, tz=_tz.utc).strftime("%m-%d %H:%M") if s["started_at_ms"] else "?"
+                df_cli.append({
+                    "Agent": s["agent"], "Session": s["session_id"],
+                    "Provider": s["provider"], "Model": s["model"],
+                    "Status": s["status"], "Runtime (s)": s["runtime_s"],
+                    "Tokens": f"{s['tokens']:,}",
+                    "Cost $": "included" if s["provider"] == "claude-cli" and s["cost_usd"] == 0 else f"${s['cost_usd']:.4f}",
+                    "Started": ts,
+                })
+            st.dataframe(pd.DataFrame(df_cli), use_container_width=True, hide_index=True)
+
+        # ── Raw expanders ──────────────────────────────────────────────
+        st.markdown("---")
+        doctor_raw = health.get("doctor", "")
+        audit_raw  = health.get("security_audit", "")
+        if doctor_raw and "daily-health-check" not in doctor_raw:
+            with st.expander("Raw output — Doctor"):
+                st.code(doctor_raw, language=None)
+        if audit_raw and "daily-health-check" not in audit_raw:
+            with st.expander("Raw output — Security Audit"):
+                st.code(audit_raw, language=None)
+
+
+# ══════════════════════════════════════════════════════════════════
+# TAB 4 — Raw
+# ══════════════════════════════════════════════════════════════════
+with tabs[3]:
     st.json(data)
 
 # No auto-refresh — workers update _g in background.

@@ -1,6 +1,13 @@
 # Secrets — jamais commiter
 .env
+.mcp.json
 *.bak*
+
+# Notes locales (privées, pas pour le repo public)
+CLAUDE.md
+continue.md
+rapport_audit.md
+PLAN_EXECUTION.md
 
 # Données locales
 data/
