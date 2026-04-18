@@ -1260,7 +1260,6 @@ with tabs[2]:
         oc_ver = health.get("openclaw_version", {})
         doc_s  = health.get("doctor_structured", {})
         gw     = _g["gw"] or health.get("openclaw_gateway") or {}
-        cl     = health.get("security_classified", {})
 
         # ── Header version ─────────────────────────────────────────────
         installed = oc_ver.get("installed", "?")
@@ -1307,22 +1306,9 @@ with tabs[2]:
             for r in doc_rows:
                 st.markdown(f"- {r}")
 
-        # ── Security conditions + compteurs (basés sur décisions user) ──
+        # ── Security counters basés sur severity native + décisions user ──
         with oc_c2:
             st.markdown("#### 🛡️ Security")
-            cl_cond = cl.get("conditions", {})
-            cond_labels = {
-                "gateway_loopback": "loopback",
-                "matrix_allowlist": "allowlist",
-                "matrix_single_user": "single user",
-                "comm_exec_deny": "comm deny",
-                "web_exec_deny": "web deny",
-            }
-            badges = []
-            for ck, label in cond_labels.items():
-                ok = cl_cond.get(ck, False)
-                badges.append(f"{'✅' if ok else '❌'} {label}")
-            st.caption(" · ".join(badges))
 
             # Niveaux d'origine OpenClaw, exclusion des tolérés
             sec_section = health.get("security_structured", {}) or {}

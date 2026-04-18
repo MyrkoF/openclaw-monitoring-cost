@@ -990,174 +990,6 @@ def collect_claude_code():
     return result
 
 
-# ── Security warning classification ───────────────────────────────────────────
-
-OPENCLAW_JSON = Path.home() / ".openclaw" / "openclaw.json"
-EXEC_APPROVALS_JSON = Path.home() / ".openclaw" / "exec-approvals.json"
-
-
-def _classify_security_warnings(doctor, security):
-    """Classify doctor/security warnings against actual config conditions."""
-    # Read current config
-    try:
-        config = json.loads(OPENCLAW_JSON.read_text(encoding="utf-8"))
-    except Exception:
-        config = {}
-    try:
-        approvals = json.loads(EXEC_APPROVALS_JSON.read_text(encoding="utf-8"))
-    except Exception:
-        approvals = {}
-
-    # Extract protection conditions
-    gw = config.get("gateway", {})
-    gw_loopback = gw.get("mode", "local") == "local" or gw.get("bind", "") in ("loopback", "127.0.0.1", "localhost", "")
-    matrix = config.get("channels", {}).get("matrix", {})
-    matrix_allowlist = matrix.get("groupPolicy", "") == "allowlist"
-    matrix_users = matrix.get("groupAllowFrom", [])
-    matrix_single_user = len(matrix_users) <= 1
-    auto_join = matrix.get("autoJoin", "") == "always"
-    agents_cfg = approvals.get("agents", {})
-    comm_deny = agents_cfg.get("comm", {}).get("security", "deny") == "deny"
-    web_deny = agents_cfg.get("web", {}).get("security", "deny") == "deny"
-
-    conditions = {
-        "gateway_loopback": gw_loopback,
-        "matrix_allowlist": matrix_allowlist,
-        "matrix_single_user": matrix_single_user,
-        "comm_exec_deny": comm_deny,
-        "web_exec_deny": web_deny,
-    }
-
-    danger = []
-    warning = []
-    silenced = []
-
-    all_warnings = security.get("warnings", []) + doctor.get("compat_warnings", [])
-
-    for w in all_warnings:
-        msg = w.get("message", "") if isinstance(w, dict) else str(w)
-        if not msg.strip():
-            continue  # skip empty warnings
-        fix = w.get("fix", "") if isinstance(w, dict) else ""
-        wid = w.get("id", "") if isinstance(w, dict) else ""
-        entry = {"message": msg[:200], "fix": fix[:200], "id": wid}
-
-        # --- Classification rules ---
-
-        # Full exec trust
-        if "exec trust" in msg.lower() or "exec.security" in msg.lower():
-            if not gw_loopback:
-                entry["reason"] = "Gateway exposed to network"
-                danger.append(entry)
-            elif not matrix_allowlist or not matrix_single_user:
-                entry["reason"] = "Matrix not restricted to single user"
-                warning.append(entry)
-            elif not comm_deny or not web_deny:
-                entry["reason"] = "comm/web have exec access"
-                warning.append(entry)
-            else:
-                entry["reason"] = "Loopback + allowlist + comm/web deny"
-                silenced.append(entry)
-
-        # autoAllowSkills
-        elif "autoallowskills" in msg.lower() or "auto_allow_skills" in msg.lower():
-            if not gw_loopback:
-                entry["reason"] = "Gateway exposed — skills could be exploited"
-                danger.append(entry)
-            else:
-                entry["reason"] = "Local install, skills controlled manually"
-                silenced.append(entry)
-
-        # Multi-user heuristic
-        elif "multi" in msg.lower() and "user" in msg.lower():
-            if not matrix_allowlist:
-                entry["reason"] = "Matrix policy is not allowlist"
-                danger.append(entry)
-            elif not matrix_single_user:
-                entry["reason"] = f"Multiple users in allowFrom: {matrix_users}"
-                warning.append(entry)
-            else:
-                entry["reason"] = "Single-user allowlist active"
-                silenced.append(entry)
-
-        # Weak/smaller models
-        elif "smaller" in msg.lower() or "weak" in msg.lower() or "susceptible" in msg.lower():
-            # Check if weak models are primary on agents with exec
-            silenced.append({**entry, "reason": "Weak models on fallback/comm only (no external inputs)"})
-
-        # Sandbox off
-        elif "sandbox" in msg.lower():
-            if not comm_deny or not web_deny:
-                entry["reason"] = "Sandbox off AND exec enabled on comm/web"
-                warning.append(entry)
-            else:
-                entry["reason"] = "comm/web exec denied — sandbox irrelevant"
-                silenced.append(entry)
-
-        # exec broader than policy
-        elif "broader" in msg.lower() and "exec" in msg.lower():
-            agent_name = ""
-            for a in ("comm", "web", "siyuan", "main"):
-                if a in msg.lower():
-                    agent_name = a
-                    break
-            agent_sec = agents_cfg.get(agent_name, {}).get("security", "deny")
-            if agent_sec == "deny":
-                entry["reason"] = f"{agent_name} exec-approvals=deny overrides"
-                silenced.append(entry)
-            elif agent_sec == "full":
-                entry["reason"] = f"{agent_name} has full exec AND broader policy"
-                warning.append(entry)
-            else:
-                entry["reason"] = f"{agent_name} exec-approvals={agent_sec}"
-                warning.append(entry)
-
-        # Gateway probe failed
-        elif "gateway" in msg.lower() and ("probe" in msg.lower() or "failed" in msg.lower()):
-            entry["reason"] = "Transient — check if persistent"
-            warning.append(entry)
-
-        # Legacy hook (cognee)
-        elif "legacy" in msg.lower() or "cognee" in msg.lower():
-            entry["reason"] = "Cosmetic deprecation warning"
-            silenced.append(entry)
-
-        # Permissive tool policy / elevated
-        elif "permissive" in msg.lower() or "elevated" in msg.lower() or "tool policy" in msg.lower():
-            if gw_loopback and matrix_allowlist:
-                entry["reason"] = "Loopback + allowlist — acceptable"
-                silenced.append(entry)
-            else:
-                entry["reason"] = "Permissive tools with exposed gateway"
-                warning.append(entry)
-
-        # Attack surface summary (info)
-        elif "attack surface" in msg.lower():
-            silenced.append({**entry, "reason": "Informational summary"})
-
-        # Extension plugins
-        elif "extension plugin" in msg.lower() or "enabled plugin" in msg.lower():
-            silenced.append({**entry, "reason": "Locally installed plugins"})
-
-        # Catch-all: unknown warnings default to warning
-        else:
-            entry["reason"] = "Unclassified — review manually"
-            warning.append(entry)
-
-    return {
-        "classified_at": datetime.now(timezone.utc).isoformat(),
-        "danger": danger,
-        "warning": warning,
-        "silenced": silenced,
-        "conditions": conditions,
-        "summary": {
-            "danger": len(danger),
-            "warning": len(warning),
-            "silenced": len(silenced),
-        },
-    }
-
-
 # ── Assemblage ─────────────────────────────────────────────────────────────────
 
 def _need_audit():
@@ -1210,7 +1042,6 @@ def build_report():
         openclaw_version = collect_openclaw_version()
         doctor           = collect_openclaw_doctor()
         security         = collect_openclaw_security()
-        classified       = _classify_security_warnings(doctor, security)
         meta["audit_at"] = datetime.now(timezone.utc).isoformat()
         # Consume flag
         try:
@@ -1221,7 +1052,7 @@ def build_report():
         # Reuse previous audit results
         cached = _reuse_from_sidecar(
             "network", "watchtower", "github_cli", "openclaw_version",
-            "openclaw_doctor", "openclaw_security", "security_classified",
+            "openclaw_doctor", "openclaw_security",
         )
         network          = cached["network"] or {}
         watchtower       = cached["watchtower"] or {"raw_last50": [], "updates": [], "errors": [], "image_updates": []}
@@ -1229,7 +1060,6 @@ def build_report():
         openclaw_version = cached["openclaw_version"] or {}
         doctor           = cached["openclaw_doctor"] or {"output": ["Audit pas encore exécuté"], "status": "ok", "exit_code": 0}
         security         = cached["openclaw_security"] or {"output": ["Audit pas encore exécuté"], "issues": [], "status": "ok", "exit_code": 0}
-        classified       = cached["security_classified"] or {}
         # Preserve audit timestamp from previous run
         try:
             prev = json.loads(SIDECAR_PATH.read_text(encoding="utf-8"))
@@ -1237,10 +1067,11 @@ def build_report():
         except Exception:
             pass
 
-    # Calcul du statut global
-    if classified.get("danger"):
+    # Calcul du statut global — basé directement sur summary native d'OpenClaw
+    sec_summary = security.get("summary", {})
+    if sec_summary.get("critical", 0) > 0:
         security["status"] = "error"
-    elif classified.get("warning"):
+    elif sec_summary.get("warn", 0) > 0:
         security["status"] = "warn"
 
     global_status = _calc_status(
@@ -1262,7 +1093,6 @@ def build_report():
         "openclaw_version":  openclaw_version,
         "openclaw_doctor":   doctor,
         "openclaw_security": security,
-        "security_classified": classified,
         "services":          services,
         "wireguard":         wireguard,
         "github_cli":        github_cli,

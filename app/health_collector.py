@@ -579,7 +579,6 @@ def collect_system(gw_override=None):
     # OpenClaw doctor / security audit — garder les données structurées
     doctor_section = sidecar.get("openclaw_doctor", {})
     audit_section  = sidecar.get("openclaw_security", {})
-    security_classified = sidecar.get("security_classified", {})
     # Raw output pour expander debug
     doctor_raw  = doctor_section.get("output", sidecar.get("doctor", ""))
     audit_raw   = audit_section.get("output",  sidecar.get("security_audit", ""))
@@ -642,7 +641,6 @@ def collect_system(gw_override=None):
         "security_audit":     audit_raw  or "Lancer daily-health-check.py sur le host",
         "doctor_structured":  doctor_section,
         "security_structured": audit_section,
-        "security_classified": security_classified,
         "wireguard":          wireguard,
         "github_cli":         github_cli,
         "tmux":               tmux,
